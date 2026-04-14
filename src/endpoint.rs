@@ -2,7 +2,10 @@ use std::{str::FromStr, time::Duration};
 
 use iroh::{Endpoint, SecretKey, discovery::dns::DnsDiscovery, endpoint::default_relay_mode};
 use iroh_base::RelayUrl;
-use iroh_relay::{RelayConfig, RelayMap, dns::{DnsProtocol, DnsResolver}};
+use iroh_relay::{
+    RelayConfig, RelayMap,
+    dns::{DnsProtocol, DnsResolver},
+};
 use n0_error::{Result, StdResultExt};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -14,11 +17,9 @@ pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<En
     let relay_mode = relay_mode_from_env_or_build().await?;
     let mut builder = match common.discovery_mode {
         DiscoveryMode::Dns => Endpoint::empty_builder(relay_mode).secret_key(secret_key),
-        DiscoveryMode::Default | DiscoveryMode::Hybrid => {
-            Endpoint::builder()
-                .relay_mode(relay_mode)
-                .secret_key(secret_key)
-        }
+        DiscoveryMode::Default | DiscoveryMode::Hybrid => Endpoint::builder()
+            .relay_mode(relay_mode)
+            .secret_key(secret_key),
     };
     if let Some(addr) = common.ipv4_addr {
         builder = builder.bind_addr_v4(addr);
