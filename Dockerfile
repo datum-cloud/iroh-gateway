@@ -4,6 +4,9 @@ WORKDIR /app
 
 COPY . .
 
+ARG BUILD_IROH_SERVICES_API_KEY
+ENV BUILD_IROH_SERVICES_API_KEY=${BUILD_IROH_SERVICES_API_KEY}
+
 RUN cargo build --release
 
 FROM debian:bookworm-slim
