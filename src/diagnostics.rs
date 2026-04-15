@@ -6,6 +6,8 @@ use n0_error::{Result, StackResultExt, StdResultExt};
 use tracing::{info, warn};
 
 const IROH_SERVICES_API_KEY: &str = "IROH_SERVICES_API_KEY";
+const IROH_SERVICES_LABEL: &str = "IROH_SERVICES_LABEL";
+const DEFAULT_LABEL: &str = "iroh-gateway";
 
 /// Keeps the diagnostics client and router alive for the process lifetime.
 pub struct DiagnosticsHandle {
@@ -51,7 +53,12 @@ pub async fn maybe_start(endpoint: &Endpoint) -> Option<DiagnosticsHandle> {
     let remote_id = api_secret.addr().id;
     info!(remote = %remote_id.fmt_short(), "connecting to iroh-services for net diagnostics");
 
-    let client_builder = match Client::builder(endpoint).api_secret(api_secret) {
+    let label = std::env::var(IROH_SERVICES_LABEL).unwrap_or_else(|_| DEFAULT_LABEL.to_string());
+
+    let client_builder = match Client::builder(endpoint)
+        .api_secret(api_secret)
+        .and_then(|b| b.name(label))
+    {
         Ok(b) => b,
         Err(err) => {
             warn!("failed to start net diagnostics, continuing without: {err:#}");
