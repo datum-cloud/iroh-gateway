@@ -16,6 +16,4 @@ jobs:
     uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.9.0
     with:
       image-name: iroh-gateway
-      extra-build-args: |
-        BUILD_IROH_SERVICES_API_KEY=${{ secrets.BUILD_IROH_SERVICES_API_KEY }}
     secrets: inherit
