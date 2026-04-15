@@ -72,27 +72,11 @@ enum DiscoveryModeArg {
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
-        .with(sentry::integrations::tracing::layer())
         .init();
 
     if let Ok(path) = dotenv::dotenv() {
         info!("loaded environment variables from {}", path.display());
     }
-
-    let _sentry_guard = sentry::init(sentry::ClientOptions {
-        dsn: std::env::var("SENTRY_DSN")
-            .ok()
-            .and_then(|s| s.parse().ok()),
-        release: sentry::release_name!(),
-        send_default_pii: true,
-        before_send: Some(std::sync::Arc::new(|event| match event.level {
-            sentry::Level::Error | sentry::Level::Fatal => Some(event),
-            _ if rand::random::<f64>() < 0.1 => Some(event),
-            _ => None,
-        })),
-        traces_sample_rate: 0.1,
-        ..Default::default()
-    });
 
     let args = Args::parse();
 
