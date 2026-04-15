@@ -9,6 +9,7 @@ use tracing::info;
 use tracing_subscriber::prelude::*;
 
 mod config;
+mod diagnostics;
 mod endpoint;
 mod gateway;
 

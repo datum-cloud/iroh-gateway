@@ -34,6 +34,7 @@ pub async fn bind_and_serve(
 ) -> Result<()> {
     let listener = TcpListener::bind(tcp_bind_addr).await?;
     let endpoint = build_endpoint(secret_key, &config.common).await?;
+    let _diagnostics = crate::diagnostics::maybe_start(&endpoint).await;
     serve_with_metrics(
         endpoint,
         listener,
@@ -299,15 +300,10 @@ impl ErrorResponseWriter {
 
 fn has_existing_peer_conn(endpoint: &Endpoint) -> bool {
     let endpoint_metrics = endpoint.metrics();
-    let direct_current = endpoint_metrics
-        .magicsock
-        .num_direct_conns_added
+    let conns_current = endpoint_metrics
+        .socket
+        .num_conns_opened
         .get()
-        .saturating_sub(endpoint_metrics.magicsock.num_direct_conns_removed.get());
-    let relay_current = endpoint_metrics
-        .magicsock
-        .num_relay_conns_added
-        .get()
-        .saturating_sub(endpoint_metrics.magicsock.num_relay_conns_removed.get());
-    direct_current + relay_current > 0
+        .saturating_sub(endpoint_metrics.socket.num_conns_closed.get());
+    conns_current > 0
 }
