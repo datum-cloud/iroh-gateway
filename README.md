@@ -53,7 +53,7 @@ On first run, a secret key is generated and written to `gateway_key` (or the pat
 | `IROH_GATEWAY_KEY_FILE` | Path to the secret key file (same as `--key-file`) |
 | `IROH_GATEWAY_CONFIG_FILE` | Path to the YAML config file (same as `--config-file`) |
 | `IROH_GATEWAY_RELAY_URLS` | Comma or space-separated list of iroh relay URLs to use |
-| `SENTRY_DSN` | Sentry DSN for error reporting |
+| `IROH_SERVICES_API_KEY` | iroh-services API key — enables net diagnostics when set |
 
 `BUILD_IROH_GATEWAY_RELAY_URLS` can be set at compile time to bake a relay list into the binary as a fallback when the runtime variable is not set.
 
