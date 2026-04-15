@@ -34,6 +34,7 @@ pub async fn bind_and_serve(
 ) -> Result<()> {
     let listener = TcpListener::bind(tcp_bind_addr).await?;
     let endpoint = build_endpoint(secret_key, &config.common).await?;
+    let _diagnostics = crate::diagnostics::maybe_start(&endpoint).await;
     serve_with_metrics(
         endpoint,
         listener,
