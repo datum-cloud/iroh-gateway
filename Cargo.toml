@@ -23,7 +23,7 @@ iroh-base = "0.97"
 iroh-metrics = "0.38"
 iroh-proxy-utils = "0.1.0"
 iroh-relay = "0.97"
-iroh-services = { version = "0.12", features = ["net_diagnostics", "client_host"] }
+iroh-services = "0.13"
 n0-error = { version = "0.1", features = ["anyhow"] }
 rand = "0.9"
 reqwest = { version = "0.12", features = ["rustls-tls"] }
