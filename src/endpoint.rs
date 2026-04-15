@@ -1,6 +1,10 @@
 use std::{str::FromStr, time::Duration};
 
-use iroh::{Endpoint, SecretKey, discovery::dns::DnsDiscovery, endpoint::default_relay_mode};
+use iroh::{
+    Endpoint, SecretKey,
+    address_lookup::dns::DnsAddressLookup,
+    endpoint::{default_relay_mode, presets},
+};
 use iroh_base::RelayUrl;
 use iroh_relay::{
     RelayConfig, RelayMap,
@@ -16,16 +20,18 @@ use crate::config::{Config, DiscoveryMode};
 pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
     let relay_mode = relay_mode_from_env_or_build().await?;
     let mut builder = match common.discovery_mode {
-        DiscoveryMode::Dns => Endpoint::empty_builder(relay_mode).secret_key(secret_key),
-        DiscoveryMode::Default | DiscoveryMode::Hybrid => Endpoint::builder()
+        DiscoveryMode::Dns => Endpoint::empty_builder()
+            .relay_mode(relay_mode)
+            .secret_key(secret_key),
+        DiscoveryMode::Default | DiscoveryMode::Hybrid => Endpoint::builder(presets::N0)
             .relay_mode(relay_mode)
             .secret_key(secret_key),
     };
     if let Some(addr) = common.ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = common.ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr)?;
     }
     match common.discovery_mode {
         DiscoveryMode::Default => {}
@@ -42,7 +48,7 @@ pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<En
                     .build();
                 builder = builder.dns_resolver(resolver);
             }
-            builder = builder.discovery(DnsDiscovery::builder(origin));
+            builder = builder.address_lookup(DnsAddressLookup::builder(origin));
         }
     }
     let endpoint = builder.bind().await?;
