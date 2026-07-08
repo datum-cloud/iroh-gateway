@@ -150,7 +150,7 @@ async fn load_or_create_key(key_file: &PathBuf) -> Result<SecretKey> {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         tokio::fs::write(key_file, key.to_bytes()).await?;
         return Ok(key);
     }

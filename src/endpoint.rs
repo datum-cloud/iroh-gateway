@@ -3,13 +3,11 @@ use std::{str::FromStr, time::Duration};
 use iroh::{
     Endpoint, SecretKey,
     address_lookup::dns::DnsAddressLookup,
+    dns::{DnsProtocol, DnsResolver},
     endpoint::{default_relay_mode, presets},
 };
 use iroh_base::RelayUrl;
-use iroh_relay::{
-    RelayConfig, RelayMap,
-    dns::{DnsProtocol, DnsResolver},
-};
+use iroh_relay::{RelayConfig, RelayMap};
 use n0_error::{Result, StdResultExt};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -20,7 +18,7 @@ use crate::config::{Config, DiscoveryMode};
 pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
     let relay_mode = relay_mode_from_env_or_build().await?;
     let mut builder = match common.discovery_mode {
-        DiscoveryMode::Dns => Endpoint::empty_builder()
+        DiscoveryMode::Dns => Endpoint::builder(presets::Empty)
             .relay_mode(relay_mode)
             .secret_key(secret_key),
         DiscoveryMode::Default | DiscoveryMode::Hybrid => Endpoint::builder(presets::N0)
