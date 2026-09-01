@@ -23,6 +23,9 @@ Two request modes are supported:
 
 The iroh endpoint identity of the target listen node is carried in the `x-iroh-endpoint-id` request header. The gateway strips all Datum-specific headers before forwarding.
 
+See [`docs/architecture`](./docs/architecture/README.md) for C4 diagrams and
+request-flow sequence diagrams.
+
 ## Running
 
 ```sh
