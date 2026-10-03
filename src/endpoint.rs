@@ -15,16 +15,33 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, DiscoveryMode};
 
 /// Build a new iroh endpoint, applying all relevant details from configuration.
-pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
-    let relay_mode = relay_mode_from_env_or_build().await?;
+pub async fn build_endpoint(
+    secret_key: SecretKey,
+    common: &Config,
+    ip_underlay_only: bool,
+) -> Result<Endpoint> {
+    let relay_mode = if matches!(common.discovery_mode, DiscoveryMode::Static) {
+        iroh::endpoint::RelayMode::Disabled
+    } else {
+        relay_mode_from_env_or_build().await?
+    };
     let mut builder = match common.discovery_mode {
-        DiscoveryMode::Dns => Endpoint::builder(presets::Empty)
+        DiscoveryMode::Dns | DiscoveryMode::Static => Endpoint::builder(presets::Empty)
             .relay_mode(relay_mode)
             .secret_key(secret_key),
         DiscoveryMode::Default | DiscoveryMode::Hybrid => Endpoint::builder(presets::N0)
             .relay_mode(relay_mode)
             .secret_key(secret_key),
     };
+    // Empty presets (DNS/static discovery) deliberately omit the TLS provider.
+    // Configure it explicitly, independent of rustls's process-wide default.
+    builder =
+        builder.crypto_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()));
+    if ip_underlay_only {
+        // GatewayConfig validates one explicit underlay bind. Clear BOTH defaults:
+        // replacing one family alone leaves the other wildcard advertising TUNs.
+        builder = builder.clear_ip_transports();
+    }
     if let Some(addr) = common.ipv4_addr {
         builder = builder.bind_addr(addr)?;
     }
@@ -32,7 +49,7 @@ pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<En
         builder = builder.bind_addr(addr)?;
     }
     match common.discovery_mode {
-        DiscoveryMode::Default => {}
+        DiscoveryMode::Default | DiscoveryMode::Static => {}
         DiscoveryMode::Dns | DiscoveryMode::Hybrid => {
             let origin = match &common.dns_origin {
                 Some(origin) => origin.clone(),
@@ -50,11 +67,15 @@ pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<En
         }
     }
     let endpoint = builder.bind().await?;
+    if ip_underlay_only {
+        info!(underlay_address=?common.ip_underlay_socket(), "CONNECT-IP disables automatic direct-IP transport binding");
+    }
     info!(id = %endpoint.id(), "iroh endpoint bound");
     Ok(endpoint)
 }
 
 const IROH_GATEWAY_RELAY_URLS: &str = "IROH_GATEWAY_RELAY_URLS";
+
 const BUILD_IROH_GATEWAY_RELAY_URLS: &str = "BUILD_IROH_GATEWAY_RELAY_URLS";
 const STARTUP_RELAY_SELECTION_MAX: usize = 5;
 const STARTUP_RELAY_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
@@ -276,4 +297,37 @@ async fn probe_relay_latency(
 
 fn relays_to_map(relays: Vec<RelayUrl>) -> RelayMap {
     RelayMap::from_iter(relays.into_iter().map(RelayConfig::from))
+}
+
+#[cfg(test)]
+mod underlay_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_ip_mode_removes_both_default_wildcard_sockets() {
+        // Loopback tests the socket builder without installing a TUN or using
+        // external discovery. Production configuration rejects loopback binds.
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let address: std::net::SocketAddr = address.parse().unwrap();
+            let mut config = Config {
+                discovery_mode: DiscoveryMode::Static,
+                ..Default::default()
+            };
+            match address {
+                std::net::SocketAddr::V4(address) => config.ipv4_addr = Some(address),
+                std::net::SocketAddr::V6(address) => config.ipv6_addr = Some(address),
+            }
+            let endpoint = build_endpoint(SecretKey::generate(), &config, true)
+                .await
+                .unwrap();
+            let sockets = endpoint.bound_sockets();
+            assert_eq!(
+                sockets.len(),
+                1,
+                "unexpected wildcard or additional socket: {sockets:?}"
+            );
+            assert_eq!(sockets[0].ip(), address.ip());
+            endpoint.close().await;
+        }
+    }
 }

@@ -1,0 +1,7 @@
+.git
+**/.git
+target
+**/target
+.env
+gateway_key
+__pycache__

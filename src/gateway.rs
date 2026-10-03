@@ -20,7 +20,10 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tracing::info;
 
+mod ip;
+mod masque;
 mod metrics;
+mod udp;
 
 use self::metrics::{GatewayMetrics, MetricsHttpState, serve_metrics_http, shared_gateway_metrics};
 use crate::endpoint::build_endpoint;
@@ -31,18 +34,186 @@ pub async fn bind_and_serve(
     tcp_bind_addr: SocketAddr,
     metrics_bind_addr: Option<SocketAddr>,
     #[cfg(unix)] uds_listener: Option<UnixListener>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    config.validate()?;
+    let ip_config = match &config.ip_config {
+        Some(path) => {
+            if !cfg!(target_os = "linux") {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "CONNECT-IP gateway requires Linux TUN support",
+                )
+                .into());
+            }
+            Some(ip::IpConfig::load(path).await?)
+        }
+        None => None,
+    };
+    if let Some(grants) = &ip_config {
+        let underlay = config.common.ip_underlay_socket().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CONNECT-IP requires exactly one explicit underlay address",
+            )
+        })?;
+        if underlay.ip().is_unspecified() {
+            if !underlay.ip().is_ipv6()
+                || underlay.port() != 0
+                || matches!(
+                    config.common.discovery_mode,
+                    crate::config::DiscoveryMode::Static
+                )
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an unspecified CONNECT-IP bind is allowed only as [::]:0 with relay discovery",
+                )
+                .into());
+            }
+            grants.validate_relay_only()?;
+        } else {
+            grants.validate_underlay(underlay.ip())?;
+        }
+    }
+    let _cancel_on_drop = shutdown.clone().drop_guard();
     let listener = TcpListener::bind(tcp_bind_addr).await?;
-    let endpoint = build_endpoint(secret_key, &config.common).await?;
+    // Bind all ingress before serving any of it; a bad/occupied UDP listener
+    // must fail startup rather than silently leave a partially working gateway.
+    let mut udp_listeners = Vec::new();
+    for forward in &config.udp_forwards {
+        udp_listeners.push((
+            forward.clone(),
+            tokio::net::UdpSocket::bind(forward.bind_addr).await?,
+        ));
+    }
+    let endpoint = build_endpoint(secret_key, &config.common, ip_config.is_some()).await?;
     let _diagnostics = crate::diagnostics::maybe_start(&endpoint).await;
-    serve_with_metrics(
+    if !matches!(config.transport, crate::config::TransportMode::Legacy) {
+        if ip_config.is_some() {
+            endpoint.set_alpns(vec![connect_transport::ip::ALPN.to_vec()]);
+        }
+        let transport = connect_transport::Transport::client(endpoint.clone());
+        let legacy = matches!(config.transport, crate::config::TransportMode::Auto)
+            .then(|| DownstreamProxy::new(endpoint.clone(), Default::default()));
+        // The legacy connection pool resolves by key. Operator-provided peer
+        // addresses must be available to both transports, never HTTP callers.
+        if !config.peers.is_empty() {
+            let lookup = iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(
+                config.peers.iter().map(|(id, addresses)| {
+                    addresses
+                        .iter()
+                        .fold(iroh::EndpointAddr::new(*id), |peer, addr| {
+                            peer.with_ip_addr(*addr)
+                        })
+                }),
+            );
+            endpoint.address_lookup()?.add(lookup);
+        }
+        let metrics = shared_gateway_metrics();
+        let udp_metrics = Arc::new(udp::UdpMetrics::default());
+        let ip_metrics = Arc::new(ip::IpMetrics::default());
+        let mut tasks = tokio::task::JoinSet::<io::Result<()>>::new();
+        if let Some(addr) = metrics_bind_addr {
+            let state = MetricsHttpState::masque(
+                endpoint.clone(),
+                metrics.clone(),
+                transport.clone(),
+                udp_metrics.clone(),
+                ip_metrics.clone(),
+            )
+            .with_downstream(legacy.as_ref().map(|proxy| proxy.metrics().clone()));
+            let cancel = shutdown.clone();
+            tasks.spawn(async move {
+                tokio::select! {
+                    result = serve_metrics_http(addr, state) => result.map_err(io::Error::other),
+                    _ = cancel.cancelled() => Ok(()),
+                }
+            });
+        }
+        info!(endpoint_id = %transport.endpoint_id(), mode=?config.transport, "gateway started");
+        if let Some(config) = ip_config {
+            tasks.spawn(ip::serve(
+                endpoint.clone(),
+                config,
+                ip_metrics,
+                shutdown.clone(),
+            ));
+        }
+        #[cfg(unix)]
+        if let Some(listener) = uds_listener {
+            let uds_transport = transport.clone();
+            let peers = config.peers.clone();
+            let metrics = metrics.clone();
+            let cancel = shutdown.clone();
+            let legacy = legacy.clone();
+            tasks.spawn(async move {
+                tokio::select! {
+                    result = masque::serve_uds(listener, uds_transport, peers, metrics, legacy) => result,
+                    _ = cancel.cancelled() => Ok(()),
+                }
+            });
+        }
+        for (forward, socket) in udp_listeners {
+            let peer = config
+                .peers
+                .get(&forward.connector)
+                .into_iter()
+                .flatten()
+                .fold(iroh::EndpointAddr::new(forward.connector), |peer, addr| {
+                    peer.with_ip_addr(*addr)
+                });
+            let options = udp::UdpOptions {
+                max_associations: config.udp_max_associations,
+                idle_timeout: std::time::Duration::from_secs(config.udp_idle_timeout_secs),
+                queue_capacity: 32,
+            };
+            let transport = transport.clone();
+            let metrics = udp_metrics.clone();
+            let cancel = shutdown.clone();
+            info!(bind_addr=%forward.bind_addr, peer=%forward.connector, port=forward.port, "UDP gateway listener started");
+            tasks.spawn(udp::serve(
+                socket,
+                transport,
+                peer,
+                forward.port,
+                options,
+                metrics,
+                cancel,
+            ));
+        }
+        let http_transport = transport.clone();
+        let cancel = shutdown.clone();
+        tasks.spawn(async move {
+            tokio::select! {
+                result = masque::serve(listener, http_transport, config.peers, metrics, legacy) => result,
+                _ = cancel.cancelled() => Ok(()),
+            }
+        });
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => Ok(()),
+            task = tasks.join_next() => match task {
+                Some(Ok(Err(error))) => Err(error),
+                Some(Err(error)) => Err(io::Error::other(error)),
+                _ if shutdown.is_cancelled() => Ok(()),
+                _ => Err(io::Error::other("gateway listener stopped unexpectedly")),
+            }
+        };
+        shutdown.cancel();
+        while tasks.join_next().await.is_some() {}
+        transport.shutdown().await;
+        return Ok(result?);
+    }
+    tokio::select! {
+        result = serve_with_metrics(
         endpoint,
         listener,
         metrics_bind_addr,
         #[cfg(unix)]
         uds_listener,
-    )
-    .await
+        ) => result,
+        _ = shutdown.cancelled() => Ok(()),
+    }
 }
 
 pub async fn serve(endpoint: Endpoint, listener: TcpListener) -> Result<()> {
@@ -134,7 +305,12 @@ const HEADER_NODE_ID: &str = "x-iroh-endpoint-id";
 const HEADER_TARGET_HOST: &str = "x-datum-target-host";
 const HEADER_TARGET_PORT: &str = "x-datum-target-port";
 
-const DATUM_HEADERS: [&str; 3] = [HEADER_NODE_ID, HEADER_TARGET_HOST, HEADER_TARGET_PORT];
+const DATUM_HEADERS: [&str; 4] = [
+    HEADER_NODE_ID,
+    HEADER_TARGET_HOST,
+    HEADER_TARGET_PORT,
+    masque::TRANSPORT_HEADER,
+];
 
 struct HeaderResolver {
     endpoint: Endpoint,
@@ -147,6 +323,11 @@ impl RequestHandler for HeaderResolver {
         src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
+        if masque::selected_transport(&req.headers, crate::config::TransportMode::Legacy).is_err() {
+            return Err(Deny::bad_request(
+                "unsupported or invalid destination transport",
+            ));
+        }
         let is_tcp = matches!(src_addr, SrcAddr::Tcp(_));
         match src_addr {
             SrcAddr::Tcp(_) => self.metrics.inc_tcp_requests(),

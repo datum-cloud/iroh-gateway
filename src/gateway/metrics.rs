@@ -17,6 +17,11 @@ use tracing::info;
 
 #[derive(Debug, Default)]
 pub(super) struct GatewayMetrics {
+    dispatch_legacy: AtomicU64,
+    dispatch_masque: AtomicU64,
+    dispatch_invalid: AtomicU64,
+    dispatch_failures_legacy: AtomicU64,
+    dispatch_failures_masque: AtomicU64,
     requests_tunnel_total: AtomicU64,
     requests_origin_total: AtomicU64,
     requests_tcp_total: AtomicU64,
@@ -53,6 +58,43 @@ pub(super) fn shared_gateway_metrics() -> Arc<GatewayMetrics> {
 }
 
 impl GatewayMetrics {
+    pub(super) fn inc_dispatch(&self, transport: &str) {
+        match transport {
+            "legacy" => &self.dispatch_legacy,
+            "masque-v1" => &self.dispatch_masque,
+            _ => &self.dispatch_invalid,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn inc_dispatch_failure(&self, transport: &str) {
+        match transport {
+            "legacy" => &self.dispatch_failures_legacy,
+            _ => &self.dispatch_failures_masque,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn render_dispatch(&self) -> String {
+        format!(
+            concat!(
+                "# HELP iroh_gateway_dispatch_total Requests by selected destination transport.\n",
+                "# TYPE iroh_gateway_dispatch_total counter\n",
+                "iroh_gateway_dispatch_total{{protocol=\"legacy\"}} {}\n",
+                "iroh_gateway_dispatch_total{{protocol=\"masque-v1\"}} {}\n",
+                "iroh_gateway_dispatch_total{{protocol=\"invalid\"}} {}\n",
+                "# HELP iroh_gateway_dispatch_failures_total Upstream setup failures by destination transport.\n",
+                "# TYPE iroh_gateway_dispatch_failures_total counter\n",
+                "iroh_gateway_dispatch_failures_total{{protocol=\"legacy\"}} {}\n",
+                "iroh_gateway_dispatch_failures_total{{protocol=\"masque-v1\"}} {}\n",
+            ),
+            self.dispatch_legacy.load(Ordering::Relaxed),
+            self.dispatch_masque.load(Ordering::Relaxed),
+            self.dispatch_invalid.load(Ordering::Relaxed),
+            self.dispatch_failures_legacy.load(Ordering::Relaxed),
+            self.dispatch_failures_masque.load(Ordering::Relaxed)
+        )
+    }
     pub(super) fn inc_tunnel_requests(&self) {
         self.requests_tunnel_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -171,7 +213,11 @@ impl GatewayMetrics {
         }
     }
 
-    fn render(&self, endpoint: &Endpoint, downstream_metrics: &Arc<DownstreamMetrics>) -> String {
+    fn render(
+        &self,
+        endpoint: &Endpoint,
+        downstream_metrics: Option<&Arc<DownstreamMetrics>>,
+    ) -> String {
         let endpoint_metrics = endpoint.metrics();
         let direct_added = endpoint_metrics.socket.transport_ip_paths_added.get();
         let direct_removed = endpoint_metrics.socket.transport_ip_paths_removed.get();
@@ -195,8 +241,10 @@ impl GatewayMetrics {
 
         let mut downstream_openmetrics = String::new();
         let mut registry = Registry::default();
-        registry.register(downstream_metrics.clone());
-        let _ = registry.encode_openmetrics_to_writer(&mut downstream_openmetrics);
+        if let Some(metrics) = downstream_metrics {
+            registry.register(metrics.clone());
+            let _ = registry.encode_openmetrics_to_writer(&mut downstream_openmetrics);
+        }
 
         format!(
             concat!(
@@ -320,6 +368,7 @@ impl GatewayMetrics {
             paths_direct,
             paths_relay,
         ) + &downstream_openmetrics
+            + &self.render_dispatch()
     }
 }
 
@@ -327,10 +376,17 @@ impl GatewayMetrics {
 pub(super) struct MetricsHttpState {
     endpoint: Endpoint,
     metrics: Arc<GatewayMetrics>,
-    downstream_metrics: Arc<DownstreamMetrics>,
+    downstream_metrics: Option<Arc<DownstreamMetrics>>,
+    transport: Option<connect_transport::Transport>,
+    udp: Option<Arc<super::udp::UdpMetrics>>,
+    ip: Option<Arc<super::ip::IpMetrics>>,
 }
 
 impl MetricsHttpState {
+    pub(super) fn with_downstream(mut self, metrics: Option<Arc<DownstreamMetrics>>) -> Self {
+        self.downstream_metrics = metrics;
+        self
+    }
     pub(super) fn new(
         endpoint: Endpoint,
         metrics: Arc<GatewayMetrics>,
@@ -339,7 +395,27 @@ impl MetricsHttpState {
         Self {
             endpoint,
             metrics,
-            downstream_metrics,
+            downstream_metrics: Some(downstream_metrics),
+            transport: None,
+            udp: None,
+            ip: None,
+        }
+    }
+
+    pub(super) fn masque(
+        endpoint: Endpoint,
+        metrics: Arc<GatewayMetrics>,
+        transport: connect_transport::Transport,
+        udp: Arc<super::udp::UdpMetrics>,
+        ip: Arc<super::ip::IpMetrics>,
+    ) -> Self {
+        Self {
+            endpoint,
+            metrics,
+            downstream_metrics: None,
+            transport: Some(transport),
+            udp: Some(udp),
+            ip: Some(ip),
         }
     }
 }
@@ -357,13 +433,73 @@ pub(super) async fn serve_metrics_http(addr: SocketAddr, state: MetricsHttpState
 async fn metrics_handler(
     State(state): State<MetricsHttpState>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
+    let mut rendered = state
+        .metrics
+        .render(&state.endpoint, state.downstream_metrics.as_ref());
+    if let Some(transport) = state.transport {
+        let stats = transport.stats();
+        use std::fmt::Write;
+        for (name, kind, help, value) in [
+            (
+                "active_tcp",
+                "gauge",
+                "Active MASQUE TCP streams.",
+                stats.active_tcp as u64,
+            ),
+            (
+                "active_udp",
+                "gauge",
+                "Active MASQUE UDP associations.",
+                stats.active_udp as u64,
+            ),
+            (
+                "datagrams_dropped_total",
+                "counter",
+                "Datagrams dropped by MASQUE size or queue limits.",
+                stats.datagrams_dropped,
+            ),
+            (
+                "bytes_sent_total",
+                "counter",
+                "Payload bytes sent over MASQUE.",
+                stats.bytes_sent,
+            ),
+            (
+                "bytes_received_total",
+                "counter",
+                "Payload bytes received over MASQUE.",
+                stats.bytes_received,
+            ),
+            (
+                "errors_total",
+                "counter",
+                "MASQUE transport failures.",
+                stats.errors,
+            ),
+            (
+                "revocations_total",
+                "counter",
+                "MASQUE sessions revoked by policy.",
+                stats.revoked,
+            ),
+        ] {
+            let _ = writeln!(
+                rendered,
+                "# HELP iroh_gateway_masque_{name} {help}\n# TYPE iroh_gateway_masque_{name} {kind}\niroh_gateway_masque_{name} {value}"
+            );
+        }
+    }
+    if let Some(udp) = state.udp {
+        rendered.push_str(&udp.render());
+    }
+    if let Some(ip) = state.ip {
+        rendered.push_str(&ip.render());
+    }
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state
-            .metrics
-            .render(&state.endpoint, &state.downstream_metrics),
+        rendered,
     )
 }
