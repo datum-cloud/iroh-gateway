@@ -29,6 +29,4 @@ RUN apt-get update \
 
 COPY --from=builder /app/target/release/iroh-gateway /usr/local/bin/iroh-gateway
 
-USER 65532:65532
-
 ENTRYPOINT ["/usr/local/bin/iroh-gateway"]

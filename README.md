@@ -91,6 +91,11 @@ Use `IROH_GATEWAY_RELAY_URLS` to pin a hosted gateway to Datum's staging relay
 URLs. Set `discovery_mode: static` only when you configure direct peer addresses;
 static discovery does not permit the wildcard underlay.
 
+Linux CONNECT-IP mode needs a TUN device and `NET_ADMIN`. The managed Compute
+gateway runs in its isolated VM as root with only the `NET_ADMIN` and `MKNOD`
+capabilities, creating `/dev/net/tun` before it starts. Do not grant these
+capabilities to a general-purpose workload.
+
 ## Docker
 
 ```sh
