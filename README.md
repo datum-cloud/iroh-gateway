@@ -1,6 +1,9 @@
 # iroh-gateway
 
-An HTTP/TCP and local UDP proxy gateway that forwards traffic through [iroh](https://github.com/n0-computer/iroh) peer-to-peer tunnels.
+iroh-gateway forwards HTTP, TCP, UDP, and CONNECT-IP traffic through encrypted
+[iroh](https://github.com/n0-computer/iroh) connections. It supports legacy
+clients and the Datum-specific MASQUE profile. Its local CONNECT-IP guide uses
+static grants; managed VPC attachments use the Connect controller.
 
 ## How it works
 
@@ -220,13 +223,31 @@ Datagrams are not retried or made reliable by the gateway.
 
 ## Metrics
 
-When `--metrics-port` is set, a Prometheus-compatible endpoint is available at `/metrics`. It exposes:
+When you set `--metrics-port`, the gateway exposes Prometheus metrics at `/metrics`.
+The endpoint reports:
 
 - Request counts by type (tunnel vs origin) and source (TCP vs UDS)
 - Denied request counts by reason (missing header, invalid endpoint ID, etc.)
 - HTTP error response counts by status code
 - iroh connection counts (direct vs relay, current vs historical)
 - Bytes sent and received through the iroh magicsock
+
+## Export OpenTelemetry traces
+
+Trace export is disabled by default. To enable OpenTelemetry Protocol over HTTP
+(OTLP/HTTP) export, set
+`DATUM_CONNECT_OTEL_ENDPOINT` on the gateway service to your collector's base
+URL. The gateway appends `/v1/traces`. You can instead set
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to the full traces URL or
+`OTEL_EXPORTER_OTLP_ENDPOINT` to the base URL. Restart the gateway after you
+change its environment.
+
+The gateway propagates W3C trace context for CONNECT-IP sessions. Trace data can
+include project network names, peer or endpoint identifiers, interface names,
+routes, request IDs, and connection diagnostics. It does not include tunneled
+packet payloads. Send traces only to a collector you trust, and apply your usual
+retention and access controls. Export requests have a three-second timeout; a
+collector outage does not stop packet forwarding.
 
 ## Validate local Connect interoperability
 
@@ -304,8 +325,11 @@ MASQUE remains opt-in with
 
 ## Run the local CONNECT-IP prototype
 
-You can test routed IPv4 or IPv6 traffic through the real Connect daemon and gateway.
-The [Linux lab](scripts/connect-ip/README.md) runs `datumctl connect join`, creates
+Use the local lab to test routed IPv4 or IPv6 traffic through the Connect daemon
+and gateway. It uses static operator grants and does not validate managed
+`ConnectNetworkBinding` reconciliation. For managed VPC access, see the
+[Connect controller guide](../connect/connect-controller/README.md). The
+[Linux lab](scripts/connect-ip/README.md) runs `datumctl connect join`, creates
 exclusive TUN interfaces inside disposable containers, and checks ping, TCP, UDP,
 authorization, revocation, and route cleanup. Only OAuth and the Cloud API are
 simulated. Your Mac routes and installed services stay unchanged.

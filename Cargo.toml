@@ -16,7 +16,7 @@ askama = "0.15.1"
 axum = "0.7"
 clap = { version = "4", features = ["derive", "env"] }
 # Shared wire implementation; Dockerfile fetches the pinned Connect revision to /connect.
-connect-transport = { path = "../connect/connect-lib/transport" }
+connect-transport = { path = "../connect/connect-lib/transport", features = ["otel"] }
 connect-ip-adapter = { path = "../connect/connect-lib/ip-adapter" }
 dotenv = "0.15"
 http-body-util = "0.1.3"
@@ -29,6 +29,9 @@ iroh-proxy-utils = "0.3"
 iroh-relay = "1.0"
 iroh-services = "1.0"
 n0-error = { version = "1.0", features = ["anyhow"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-rustls"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
 reqwest = { version = "0.12", features = ["rustls-tls"] }
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
@@ -38,6 +41,7 @@ tokio = { version = "1.34.0", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.32"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -1,12 +1,15 @@
 use clap::{Parser, ValueEnum};
 use iroh::SecretKey;
 use n0_error::{Result, StdResultExt};
+use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
 };
 use tracing::info;
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{Layer, Registry, prelude::*};
 
 mod config;
 mod diagnostics;
@@ -114,17 +117,27 @@ enum DiscoveryModeArg {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let env_file = dotenv::dotenv().ok();
     // iroh requires ring. Other dependencies also enable aws-lc, so rustls
     // cannot select a provider automatically from the combined feature set.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let (otel_layer, _otel_guard) = init_otel("iroh-gateway");
+    let otel_enabled = otel_layer.is_some();
     tracing_subscriber::registry()
+        .with(otel_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
+    if otel_enabled {
+        tracing::info!(
+            stage = "otel_exporter_init",
+            "OpenTelemetry OTLP tracing enabled"
+        );
+    }
 
-    if let Ok(path) = dotenv::dotenv() {
+    if let Some(path) = env_file {
         info!("loaded environment variables from {}", path.display());
     }
 
@@ -224,6 +237,77 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct OtelGuard(Option<SdkTracerProvider>);
+
+impl Drop for OtelGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = self.0.take()
+            && let Err(error) = provider.shutdown()
+        {
+            tracing::warn!(%error, stage="otel_shutdown", "OpenTelemetry exporter shutdown failed");
+        }
+    }
+}
+
+fn init_otel(
+    service_name: &'static str,
+) -> (Option<Box<dyn Layer<Registry> + Send + Sync>>, OtelGuard) {
+    let endpoint = std::env::var("DATUM_CONNECT_OTEL_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| otlp_traces_endpoint(&value))
+        .or_else(|| {
+            std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| otlp_traces_endpoint(&value))
+        });
+    let Some(endpoint) = endpoint else {
+        return (None, OtelGuard(None));
+    };
+    let exporter = match SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(exporter) => exporter,
+        Err(error) => {
+            eprintln!("OpenTelemetry exporter disabled: {error}");
+            return (None, OtelGuard(None));
+        }
+    };
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            Resource::builder()
+                .with_service_name(service_name)
+                .with_attributes([KeyValue::new("service.namespace", "datum")])
+                .build(),
+        )
+        .build();
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    let layer = tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer(service_name))
+        .boxed();
+    (Some(layer), OtelGuard(Some(provider)))
+}
+
+fn otlp_traces_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.trim_end_matches('/');
+    if endpoint.ends_with("/v1/traces") {
+        endpoint.to_owned()
+    } else {
+        format!("{endpoint}/v1/traces")
+    }
 }
 
 async fn shutdown_signal() {

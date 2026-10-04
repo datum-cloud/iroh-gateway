@@ -21,6 +21,8 @@ use iroh::{Endpoint, EndpointId};
 use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -396,6 +398,12 @@ struct EgressNat {
     family: &'static str,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NatCounters {
+    packets: u64,
+    bytes: u64,
+}
+
 impl EgressNat {
     async fn create(grant: &IpGrant, interface: &str) -> io::Result<Self> {
         let table = format!("datum_{}", grant.interface_name);
@@ -439,6 +447,45 @@ impl EgressNat {
     async fn remove(self) -> io::Result<()> {
         nft(&["delete", "table", self.family, &self.table]).await
     }
+
+    async fn counters(&self) -> io::Result<NatCounters> {
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            Command::new("nft")
+                .args(["list", "table", self.family, &self.table])
+                .output(),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "nft counter query timed out"))??;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "nft counter query failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        parse_nat_counters(&String::from_utf8_lossy(&output.stdout))
+            .ok_or_else(|| io::Error::other("nft output did not contain NAT rule counters"))
+    }
+}
+
+fn parse_nat_counters(output: &str) -> Option<NatCounters> {
+    let mut counters = NatCounters::default();
+    let mut found = false;
+    for line in output.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let Some(index) = fields.iter().position(|field| *field == "counter") else {
+            continue;
+        };
+        if fields.get(index + 1) != Some(&"packets") || fields.get(index + 3) != Some(&"bytes") {
+            continue;
+        }
+        let packets = fields.get(index + 2)?.parse().ok()?;
+        let bytes = fields.get(index + 4)?.parse().ok()?;
+        counters.packets = counters.packets.saturating_add(packets);
+        counters.bytes = counters.bytes.saturating_add(bytes);
+        found = true;
+    }
+    found.then_some(counters)
 }
 
 fn nat_rule(table: &str, family: &str, tun: &str, client: &str, route: &str) -> Vec<String> {
@@ -502,9 +549,29 @@ async fn session(
     metrics: Arc<IpMetrics>,
     cancel: CancellationToken,
 ) -> String {
+    let span = info_span!(
+        "connect_ip.gateway_session",
+        peer = %incoming.peer,
+        network = %incoming.network,
+        session_id = %incoming.session_id
+    );
+    let _ = span.set_parent(incoming.trace_context.clone());
+    session_inner(incoming, grant, metrics, cancel)
+        .instrument(span)
+        .await
+}
+
+async fn session_inner(
+    incoming: Incoming,
+    grant: IpGrant,
+    metrics: Arc<IpMetrics>,
+    cancel: CancellationToken,
+) -> String {
     let Incoming {
         peer,
         network,
+        session_id,
+        trace_context: _,
         session,
         ready,
     } = incoming;
@@ -558,18 +625,54 @@ async fn session(
     protocol_metrics.flush();
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
     telemetry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut health_tick = tokio::time::interval(Duration::from_secs(10));
+    health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buffer = vec![0; usize::from(grant.mtu)];
     let mut failure = None;
+    let (mut packets_to_vpc, mut packets_from_vpc) = (0u64, 0u64);
+    let (mut policy_drops_to_vpc, mut policy_drops_from_vpc) = (0u64, 0u64);
+    let mut policy_drop_reasons = HashMap::<&'static str, u64>::new();
+    let (mut last_to_vpc_at_ms, mut last_from_vpc_at_ms) = (None, None);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = telemetry_tick.tick() => protocol_metrics.flush(),
+            _ = health_tick.tick() => {
+                let stats = session.stats();
+                let (nat_postrouting_packets, nat_postrouting_bytes, nat_counter_error) =
+                    match nat.counters().await {
+                        Ok(counters) => (Some(counters.packets), Some(counters.bytes), None),
+                        Err(error) => (None, None, Some(error.to_string())),
+                    };
+                let health_span = tracing::info_span!("connect_ip.health_snapshot", %peer, %network, %session_id);
+                health_span.in_scope(|| tracing::info!(%peer, %network, interface=%tun.name(),
+                    quic_datagrams_received=stats.datagrams_received,
+                    quic_datagrams_sent=stats.datagrams_sent,
+                    packets_injected_into_vpc=packets_to_vpc,
+                    packets_returned_from_vpc=packets_from_vpc,
+                    policy_drops_to_vpc, policy_drops_from_vpc,
+                    policy_drop_reasons=?policy_drop_reasons,
+                    nat_postrouting_packets, nat_postrouting_bytes,
+                    nat_counter_error=?nat_counter_error,
+                    protocol_drops=stats.packets_dropped,
+                    protocol_errors=stats.protocol_errors,
+                    last_packet_injected_at_unix_ms=last_to_vpc_at_ms,
+                    last_packet_returned_at_unix_ms=last_from_vpc_at_ms,
+                    stage="connect_ip_health", "CONNECT-IP gateway directional health snapshot"));
+            },
             packet = session.recv() => {
                 let Some(packet) = packet else { break; };
-                if !packet_allowed(&packet, &grant, true) { metrics.dropped.fetch_add(1, Ordering::Relaxed); continue; }
+                if let Some(reason) = packet_drop_reason(&packet, &grant, true) {
+                    metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    policy_drops_to_vpc += 1;
+                    *policy_drop_reasons.entry(reason).or_default() += 1;
+                    continue;
+                }
                 let result = tokio::select! { _ = cancel.cancelled() => break, result = tun.write_packet(&packet) => result };
                 if let Err(error) = result { failure = Some(format!("TUN write failed: {}", error.kind())); break; }
                 metrics.injected_packets.fetch_add(1, Ordering::Relaxed); metrics.injected_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                packets_to_vpc += 1;
+                last_to_vpc_at_ms = Some(unix_time_ms());
             }
             received = tun.read_packet(&mut buffer) => {
                 let length = match received {
@@ -577,10 +680,20 @@ async fn session(
                     Err(error) => { failure = Some(format!("TUN read failed: {}", error.kind())); break; },
                     Ok(length) => length
                 };
-                if !packet_allowed(&buffer[..length], &grant, false) { metrics.dropped.fetch_add(1, Ordering::Relaxed); continue; }
+                if let Some(reason) = packet_drop_reason(&buffer[..length], &grant, false) {
+                    metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    policy_drops_from_vpc += 1;
+                    *policy_drop_reasons.entry(reason).or_default() += 1;
+                    continue;
+                }
                 let result = tokio::select! { _ = cancel.cancelled() => break, result = session.send(buffer[..length].to_vec()) => result };
                 match result {
-                    Ok(()) => { metrics.returned_packets.fetch_add(1, Ordering::Relaxed); metrics.returned_bytes.fetch_add(length as u64, Ordering::Relaxed); }
+                    Ok(()) => {
+                        metrics.returned_packets.fetch_add(1, Ordering::Relaxed);
+                        metrics.returned_bytes.fetch_add(length as u64, Ordering::Relaxed);
+                        packets_from_vpc += 1;
+                        last_from_vpc_at_ms = Some(unix_time_ms());
+                    }
                     // IpSession::send already counts these drops; the periodic
                     // delta collector records them once in gateway metrics.
                     Err(ip::Error::InvalidPacket | ip::Error::PacketTooLarge | ip::Error::AddressPolicy) => { tracing::debug!(%peer, %network, reason="packet_policy", "CONNECT-IP packet dropped"); }
@@ -611,8 +724,12 @@ async fn session(
 }
 
 fn packet_allowed(packet: &[u8], grant: &IpGrant, from_client: bool) -> bool {
+    packet_drop_reason(packet, grant, from_client).is_none()
+}
+
+fn packet_drop_reason(packet: &[u8], grant: &IpGrant, from_client: bool) -> Option<&'static str> {
     if packet.is_empty() || packet.len() > usize::from(grant.mtu) {
-        return false;
+        return Some("empty_or_oversized_packet");
     }
     // The transport performs full header/protocol checks. Check lengths and
     // address policy again at the TUN boundary, without parsing packet payloads.
@@ -636,18 +753,36 @@ fn packet_allowed(packet: &[u8], grant: &IpGrant, from_client: bool) -> bool {
                     .into(),
             )
         }
-        _ => return false,
+        _ => return Some("malformed_ip_header"),
     };
     if from_client {
-        source == grant.client_address.addr()
-            && grant
-                .routes
-                .iter()
-                .any(|route| route.contains(&destination))
+        if source != grant.client_address.addr() {
+            Some("source_outside_assigned_address")
+        } else if !grant
+            .routes
+            .iter()
+            .any(|route| route.contains(&destination))
+        {
+            Some("destination_outside_advertised_routes")
+        } else {
+            None
+        }
     } else {
-        destination == grant.client_address.addr()
-            && grant.routes.iter().any(|route| route.contains(&source))
+        if destination != grant.client_address.addr() {
+            Some("destination_not_assigned_to_connector")
+        } else if !grant.routes.iter().any(|route| route.contains(&source)) {
+            Some("source_outside_advertised_routes")
+        } else {
+            None
+        }
     }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -695,6 +830,22 @@ mod tests {
         let ipv4 = nat_rule("datum_dc1234", "ip", "dc1234", "192.0.2.1", "10.0.0.0/8");
         assert!(ipv4.windows(2).any(|pair| pair == ["ip", "saddr"]));
         assert!(ipv4.windows(2).any(|pair| pair == ["ip", "daddr"]));
+    }
+
+    #[test]
+    fn parses_and_sums_nft_postrouting_counters() {
+        let output = "table ip6 datum_dcip0 {\n chain postrouting {\n  counter packets 3 bytes 180 masquerade\n  counter packets 7 bytes 420 masquerade\n }\n}";
+        assert_eq!(
+            parse_nat_counters(output),
+            Some(NatCounters {
+                packets: 10,
+                bytes: 600,
+            })
+        );
+        assert_eq!(
+            parse_nat_counters("table ip6 datum_dcip0 { chain postrouting { } }"),
+            None
+        );
     }
 
     fn ipv6_config() -> IpConfig {
@@ -756,6 +907,10 @@ mod tests {
         packet[8..24].copy_from_slice(&"fd79::2".parse::<Ipv6Addr>().unwrap().octets());
         packet[24..40].copy_from_slice(&"fd78::3".parse::<Ipv6Addr>().unwrap().octets());
         assert!(packet_allowed(&packet, grant, true));
+        assert_eq!(
+            packet_drop_reason(&packet, grant, false),
+            Some("destination_not_assigned_to_connector")
+        );
         assert!(!packet_allowed(&packet, grant, false));
         assert!(!packet_allowed(&packet, &config().grants[0], true));
         packet[23] = 3;
@@ -764,7 +919,17 @@ mod tests {
         packet[24..40].copy_from_slice(&"fd79::2".parse::<Ipv6Addr>().unwrap().octets());
         assert!(packet_allowed(&packet, grant, false));
         packet[39] = 3;
+        assert_eq!(
+            packet_drop_reason(&packet, grant, false),
+            Some("destination_not_assigned_to_connector")
+        );
         assert!(!packet_allowed(&packet, grant, false));
+        packet[39] = 2;
+        packet[8..24].copy_from_slice(&"fd79::3".parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(
+            packet_drop_reason(&packet, grant, false),
+            Some("source_outside_advertised_routes")
+        );
         packet[39] = 2;
         packet[5] = 7;
         assert!(!packet_allowed(&packet, grant, false));
@@ -912,9 +1077,17 @@ mod tests {
         assert!(packet_allowed(&packet, grant, true));
         assert!(!packet_allowed(&packet, grant, false));
         packet[15] = 3;
+        assert_eq!(
+            packet_drop_reason(&packet, grant, true),
+            Some("source_outside_assigned_address")
+        );
         assert!(!packet_allowed(&packet, grant, true));
         packet[15] = 2;
         packet[16] = 8;
+        assert_eq!(
+            packet_drop_reason(&packet, grant, true),
+            Some("destination_outside_advertised_routes")
+        );
         assert!(!packet_allowed(&packet, grant, true));
     }
 }
