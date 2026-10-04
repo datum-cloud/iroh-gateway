@@ -93,8 +93,16 @@ static discovery does not permit the wildcard underlay.
 
 Linux CONNECT-IP mode needs a TUN device and `NET_ADMIN`. The managed Compute
 gateway runs in its isolated VM as root with only the `NET_ADMIN` and `MKNOD`
-capabilities, creating `/dev/net/tun` before it starts. Do not grant these
-capabilities to a general-purpose workload.
+capabilities, creating `/dev/net/tun` before it starts. The image includes
+`iproute2` and `nftables`. The gateway uses `ip` to configure the TUN address
+and routes, then installs per-session IPv6 forwarding and stateful NAT rules so
+VPC workloads can return traffic to a Connector without a platform route for
+each Connector address. NAT matches only the Connector address and explicitly
+approved VPC routes; workload network policies still apply. VPC workloads see
+the gateway's VPC address as the source, not the Connector's overlay address.
+Preserving Connector source addresses requires control-plane route advertisement
+and is not implemented by this prototype. Do not grant these capabilities to a
+general-purpose workload.
 
 ## Docker
 

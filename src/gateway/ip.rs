@@ -13,6 +13,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::process::Command;
 
 use connect_ip_adapter::{IpNet, Tun};
 use connect_transport::ip::{self, Grant, Incoming};
@@ -387,6 +388,114 @@ pub(super) async fn serve(
     result
 }
 
+/// Install narrowly scoped stateful source NAT so VPC workloads can return
+/// traffic to an overlay Connector without requiring every VPC router to learn
+/// a per-Connector route. The per-session nftables table is removed on close.
+struct EgressNat {
+    table: String,
+    family: &'static str,
+}
+
+impl EgressNat {
+    async fn create(grant: &IpGrant, interface: &str) -> io::Result<Self> {
+        let table = format!("datum_{}", grant.interface_name);
+        let family = if grant.client_address.addr().is_ipv4() {
+            "ip"
+        } else {
+            "ip6"
+        };
+        ensure_ip_forwarding(family).await?;
+        nft(&["add", "table", family, &table]).await?;
+        let result = async {
+            nft(&[
+                "add",
+                "chain",
+                family,
+                &table,
+                "postrouting",
+                "{ type nat hook postrouting priority srcnat; policy accept; }",
+            ])
+            .await?;
+            for route in &grant.routes {
+                let rule = nat_rule(
+                    &table,
+                    family,
+                    interface,
+                    &grant.client_address.addr().to_string(),
+                    &route.to_string(),
+                );
+                nft(&rule).await?;
+            }
+            Ok::<(), io::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = nft(&["delete", "table", family, &table]).await;
+            return Err(error);
+        }
+        Ok(Self { table, family })
+    }
+
+    async fn remove(self) -> io::Result<()> {
+        nft(&["delete", "table", self.family, &self.table]).await
+    }
+}
+
+fn nat_rule(table: &str, family: &str, tun: &str, client: &str, route: &str) -> Vec<String> {
+    vec![
+        "add".into(),
+        "rule".into(),
+        family.into(),
+        table.into(),
+        "postrouting".into(),
+        "iifname".into(),
+        tun.into(),
+        "oifname".into(),
+        "eth0".into(),
+        family.into(),
+        "saddr".into(),
+        client.into(),
+        family.into(),
+        "daddr".into(),
+        route.into(),
+        "counter".into(),
+        "masquerade".into(),
+    ]
+}
+
+async fn ensure_ip_forwarding(family: &str) -> io::Result<()> {
+    let path = match family {
+        "ip" => "/proc/sys/net/ipv4/ip_forward",
+        "ip6" => "/proc/sys/net/ipv6/conf/all/forwarding",
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported NAT address family",
+            ));
+        }
+    };
+    let current = tokio::fs::read_to_string(path).await?;
+    if current.trim() != "1" {
+        tokio::fs::write(path, "1").await?;
+    }
+    Ok(())
+}
+
+async fn nft(args: &[impl AsRef<std::ffi::OsStr>]) -> io::Result<()> {
+    let output = Command::new("nft").args(args).output().await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "nft {} failed: {}",
+        args.iter()
+            .map(|arg| arg.as_ref().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
 async fn session(
     incoming: Incoming,
     grant: IpGrant,
@@ -410,8 +519,27 @@ async fn session(
             }
         }
     };
+    let nat = tokio::select! {
+        _ = cancel.cancelled() => { session.cancel(); let _ = ready.send(false); return grant.interface_name; }
+        result = EgressNat::create(&grant, tun.name()) => match result {
+            Ok(nat) => {
+                tracing::info!(%peer, %network, interface=%tun.name(), client_address=%grant.client_address, routes=?grant.routes, family=%nat.family, stage="ip_nat_ready", "CONNECT-IP VPC return path ready");
+                nat
+            },
+            Err(error) => {
+                metrics.errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%peer, %network, interface=%tun.name(), %error, stage="ip_nat_setup", "CONNECT-IP VPC return path setup failed");
+                session.cancel();
+                let _ = ready.send(false);
+                return grant.interface_name;
+            }
+        }
+    };
     if ready.send(true).is_err() {
         session.cancel();
+        if let Err(error) = nat.remove().await {
+            tracing::warn!(%peer, %network, %error, stage="ip_nat_cleanup", "CONNECT-IP VPC return path cleanup failed");
+        }
         return grant.interface_name;
     }
     metrics.active.fetch_add(1, Ordering::Relaxed);
@@ -463,6 +591,11 @@ async fn session(
     }
     session.cancel();
     protocol_metrics.flush();
+    if let Err(error) = nat.remove().await {
+        tracing::warn!(%peer, %network, %error, stage="ip_nat_cleanup", "CONNECT-IP VPC return path cleanup failed");
+    } else {
+        tracing::info!(%peer, %network, stage="ip_nat_closed", "CONNECT-IP VPC return path removed");
+    }
     let final_stats = session.stats();
     if let Some(error) = session.last_error().or(failure) {
         metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -532,6 +665,36 @@ mod tests {
                 mtu: 1280,
             }],
         }
+    }
+
+    #[test]
+    fn egress_nat_is_scoped_to_the_client_route_and_vpc_interface() {
+        assert_eq!(
+            nat_rule("datum_dc1234", "ip6", "dc1234", "fdc4::1", "fd20:0:2a::/48"),
+            [
+                "add",
+                "rule",
+                "ip6",
+                "datum_dc1234",
+                "postrouting",
+                "iifname",
+                "dc1234",
+                "oifname",
+                "eth0",
+                "ip6",
+                "saddr",
+                "fdc4::1",
+                "ip6",
+                "daddr",
+                "fd20:0:2a::/48",
+                "counter",
+                "masquerade"
+            ]
+            .map(str::to_owned)
+        );
+        let ipv4 = nat_rule("datum_dc1234", "ip", "dc1234", "192.0.2.1", "10.0.0.0/8");
+        assert!(ipv4.windows(2).any(|pair| pair == ["ip", "saddr"]));
+        assert!(ipv4.windows(2).any(|pair| pair == ["ip", "daddr"]));
     }
 
     fn ipv6_config() -> IpConfig {

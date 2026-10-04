@@ -18,15 +18,19 @@ COPY . .
 ARG BUILD_IROH_SERVICES_API_KEY
 ENV BUILD_IROH_SERVICES_API_KEY=${BUILD_IROH_SERVICES_API_KEY}
 
-RUN cargo build --release --locked
+RUN --mount=type=cache,id=iroh-cargo-registry,target=/usr/local/cargo/registry \
+  --mount=type=cache,id=iroh-cargo-git,target=/usr/local/cargo/git \
+  --mount=type=cache,id=iroh-cargo-target,target=/app/target \
+  cargo build --release --locked --jobs 1 \
+  && install -D -m 0755 /app/target/release/iroh-gateway /usr/local/bin/iroh-gateway
 
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates iproute2 nftables \
   && rm -rf /var/lib/apt/lists/* \
   && useradd -u 65532 -r -s /usr/sbin/nologin iroh-gateway
 
-COPY --from=builder /app/target/release/iroh-gateway /usr/local/bin/iroh-gateway
+COPY --from=builder /usr/local/bin/iroh-gateway /usr/local/bin/iroh-gateway
 
 ENTRYPOINT ["/usr/local/bin/iroh-gateway"]
