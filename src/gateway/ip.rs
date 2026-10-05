@@ -38,9 +38,22 @@ pub(crate) struct IpGrant {
     pub client_address: IpNet,
     pub gateway_address: IpNet,
     pub routes: Vec<IpNet>,
+    #[serde(default)]
+    pub peer_routes: Vec<IpNet>,
     pub interface_name: String,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+}
+
+impl IpGrant {
+    fn advertised_routes(&self) -> impl Iterator<Item = &IpNet> {
+        self.routes.iter().chain(&self.peer_routes)
+    }
+
+    fn advertises(&self, address: IpAddr) -> bool {
+        self.advertised_routes()
+            .any(|route| route.contains(&address))
+    }
 }
 fn default_mtu() -> u16 {
     1280
@@ -120,10 +133,15 @@ impl IpConfig {
         }
         let (mut identities, mut interfaces, mut addresses) =
             (HashSet::new(), HashSet::new(), HashSet::new());
+        let available_clients: HashSet<_> = self
+            .grants
+            .iter()
+            .map(|grant| (grant.network.clone(), grant.client_address.addr()))
+            .collect();
         for grant in &self.grants {
+            let advertised: Vec<_> = grant.advertised_routes().cloned().collect();
             if grant.client_address.addr().is_ipv4() != grant.gateway_address.addr().is_ipv4()
-                || grant
-                    .routes
+                || advertised
                     .iter()
                     .any(|route| route.addr().is_ipv4() != grant.client_address.addr().is_ipv4())
             {
@@ -131,8 +149,10 @@ impl IpConfig {
                     "each IP grant must use one address family for client, gateway, and routes",
                 ));
             }
-            if grant.routes.len() > 32 {
-                return Err(invalid("IP grants cannot advertise more than 32 routes"));
+            if advertised.len() > 32 {
+                return Err(invalid(
+                    "IP grants cannot advertise more than 32 VPC and peer routes",
+                ));
             }
             if grant.network.is_empty()
                 || grant.network.len() > 63
@@ -147,7 +167,7 @@ impl IpConfig {
                 &grant.interface_name,
                 grant.gateway_address,
                 grant.mtu,
-                &grant.routes,
+                &advertised,
             )?;
             connect_ip_adapter::validate(
                 &grant.interface_name,
@@ -156,8 +176,7 @@ impl IpConfig {
                 &[],
             )?;
             if grant.routes.is_empty()
-                || grant
-                    .routes
+                || advertised
                     .iter()
                     .any(|route| route.contains(&grant.client_address.addr()))
             {
@@ -165,11 +184,21 @@ impl IpConfig {
                     "IP routes must be nonempty and cannot include the assigned client address",
                 ));
             }
-            for (index, route) in grant.routes.iter().enumerate() {
-                if grant.routes[..index].iter().any(|other| {
+            for (index, route) in advertised.iter().enumerate() {
+                if advertised[..index].iter().any(|other| {
                     route.contains(&other.network()) || other.contains(&route.network())
                 }) {
                     return Err(invalid("overlapping IP routes are unsupported"));
+                }
+            }
+            for route in &grant.peer_routes {
+                let host_prefix = if route.addr().is_ipv4() { 32 } else { 128 };
+                if route.prefix_len() != host_prefix
+                    || !available_clients.contains(&(grant.network.clone(), route.addr()))
+                {
+                    return Err(invalid(
+                        "peer routes must be host routes for another grant on the same network",
+                    ));
                 }
             }
             if !identities.insert((grant.peer, grant.network.clone()))
@@ -194,8 +223,7 @@ impl IpConfig {
                     network: grant.network.clone(),
                     address: grant.client_address.addr(),
                     routes: grant
-                        .routes
-                        .iter()
+                        .advertised_routes()
                         .map(|route| route.to_string().parse().map_err(io::Error::other))
                         .collect::<io::Result<_>>()?,
                     mtu: grant.mtu,
@@ -207,6 +235,99 @@ impl IpConfig {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+struct ActivePeer {
+    generation: u64,
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
+struct PeerRouter {
+    allowed: HashMap<IpAddr, HashSet<IpAddr>>,
+    active: Arc<Mutex<HashMap<IpAddr, ActivePeer>>>,
+    generation: AtomicU64,
+}
+
+impl PeerRouter {
+    fn new(config: &IpConfig) -> Self {
+        let allowed = config
+            .grants
+            .iter()
+            .map(|grant| {
+                (
+                    grant.client_address.addr(),
+                    grant.peer_routes.iter().map(IpNet::addr).collect(),
+                )
+            })
+            .collect();
+        Self {
+            allowed,
+            active: Arc::new(Mutex::new(HashMap::new())),
+            generation: AtomicU64::new(1),
+        }
+    }
+
+    fn register(&self, address: IpAddr) -> (PeerRegistration, mpsc::Receiver<Vec<u8>>) {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel(64);
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(address, ActivePeer { generation, sender });
+        (
+            PeerRegistration {
+                active: self.active.clone(),
+                address,
+                generation,
+            },
+            receiver,
+        )
+    }
+
+    fn is_peer_route(&self, source: IpAddr, destination: IpAddr) -> bool {
+        self.allowed
+            .get(&source)
+            .is_some_and(|destinations| destinations.contains(&destination))
+    }
+
+    fn forward(&self, source: IpAddr, destination: IpAddr, packet: &[u8]) -> bool {
+        if !self.is_peer_route(source, destination) {
+            return false;
+        }
+        let sender = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&destination)
+            .map(|entry| entry.sender.clone());
+        let Some(sender) = sender else {
+            return false;
+        };
+        // A slow peer must not stall another Connector's session. The bounded
+        // queue deliberately drops when the destination cannot keep up.
+        sender.try_send(packet.to_vec()).is_ok()
+    }
+}
+
+struct PeerRegistration {
+    active: Arc<Mutex<HashMap<IpAddr, ActivePeer>>>,
+    address: IpAddr,
+    generation: u64,
+}
+
+impl Drop for PeerRegistration {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active
+            .get(&self.address)
+            .is_some_and(|entry| entry.generation == self.generation)
+        {
+            active.remove(&self.address);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -365,6 +486,7 @@ pub(super) async fn serve(
         owned_cancel.clone(),
     );
     tokio::pin!(protocol);
+    let peer_router = Arc::new(PeerRouter::new(&config));
     let mut active = HashSet::new();
     let mut sessions = JoinSet::new();
     let result = loop {
@@ -381,7 +503,7 @@ pub(super) async fn serve(
                 let grant = config.grants.iter().find(|grant| grant.peer == request.peer && grant.network == request.network);
                 let Some(grant) = grant else { request.session.cancel(); let _ = request.ready.send(false); continue; };
                 if !active.insert(grant.interface_name.clone()) { request.session.cancel(); let _ = request.ready.send(false); metrics.errors.fetch_add(1, Ordering::Relaxed); continue; }
-                sessions.spawn(session(request, grant.clone(), metrics.clone(), owned_cancel.child_token()));
+                sessions.spawn(session(request, grant.clone(), metrics.clone(), peer_router.clone(), owned_cancel.child_token()));
             }
         }
     };
@@ -547,6 +669,7 @@ async fn session(
     incoming: Incoming,
     grant: IpGrant,
     metrics: Arc<IpMetrics>,
+    peer_router: Arc<PeerRouter>,
     cancel: CancellationToken,
 ) -> String {
     let span = info_span!(
@@ -556,7 +679,7 @@ async fn session(
         session_id = %incoming.session_id
     );
     let _ = span.set_parent(incoming.trace_context.clone());
-    session_inner(incoming, grant, metrics, cancel)
+    session_inner(incoming, grant, metrics, peer_router, cancel)
         .instrument(span)
         .await
 }
@@ -565,6 +688,7 @@ async fn session_inner(
     incoming: Incoming,
     grant: IpGrant,
     metrics: Arc<IpMetrics>,
+    peer_router: Arc<PeerRouter>,
     cancel: CancellationToken,
 ) -> String {
     let Incoming {
@@ -602,6 +726,7 @@ async fn session_inner(
             }
         }
     };
+    let (_peer_registration, mut peer_packets) = peer_router.register(grant.client_address.addr());
     if ready.send(true).is_err() {
         session.cancel();
         if let Err(error) = nat.remove().await {
@@ -677,12 +802,37 @@ async fn session_inner(
                     *policy_drop_reasons.entry(reason).or_default() += 1;
                     continue;
                 }
+                let (_, destination) = packet_addresses(&packet).expect("accepted packet has addresses");
+                if peer_router.is_peer_route(grant.client_address.addr(), destination) {
+                    if peer_router.forward(grant.client_address.addr(), destination, &packet) {
+                        tracing::debug!(%peer, %network, %session_id, %destination, stage="connect_ip_peer_forward", "CONNECT-IP packet forwarded to peer Connector");
+                    } else {
+                        metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                        *policy_drop_reasons.entry("peer_offline").or_default() += 1;
+                    }
+                    continue;
+                }
                 let result = tokio::select! { _ = cancel.cancelled() => { close_reason = "gateway_shutdown"; break; }, result = tun.write_packet(&packet) => result };
                 if let Err(error) = result { close_reason = "tun_write_failed"; failure = Some(format!("TUN write failed: {}", error.kind())); break; }
                 metrics.injected_packets.fetch_add(1, Ordering::Relaxed); metrics.injected_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
                 packets_to_vpc += 1;
                 bytes_to_vpc = bytes_to_vpc.saturating_add(packet.len() as u64);
                 last_to_vpc_at_ms = Some(unix_time_ms());
+            }
+            peer_packet = peer_packets.recv() => {
+                let Some(packet) = peer_packet else { close_reason = "peer_router_closed"; break; };
+                if let Some(reason) = packet_drop_reason(&packet, &grant, false) {
+                    metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    *policy_drop_reasons.entry(reason).or_default() += 1;
+                    continue;
+                }
+                match session.send(packet).await {
+                    Ok(()) => {},
+                    Err(ip::Error::InvalidPacket | ip::Error::PacketTooLarge | ip::Error::AddressPolicy) => {
+                        metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    },
+                    Err(error) => { close_reason = "peer_datagram_send_failed"; failure = Some(error.to_string()); break; }
+                }
             }
             received = tun.read_packet(&mut buffer) => {
                 let length = match received {
@@ -745,42 +895,42 @@ fn packet_allowed(packet: &[u8], grant: &IpGrant, from_client: bool) -> bool {
     packet_drop_reason(packet, grant, from_client).is_none()
 }
 
+fn packet_addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    match packet.first()? >> 4 {
+        4 if packet.len() >= 20
+            && packet[0] & 15 == 5
+            && usize::from(u16::from_be_bytes([packet[2], packet[3]])) == packet.len() =>
+        {
+            Some((
+                Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]).into(),
+                Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]).into(),
+            ))
+        }
+        6 if packet.len() >= 40
+            && usize::from(u16::from_be_bytes([packet[4], packet[5]])) + 40 == packet.len() =>
+        {
+            Some((
+                Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?).into(),
+                Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?).into(),
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn packet_drop_reason(packet: &[u8], grant: &IpGrant, from_client: bool) -> Option<&'static str> {
     if packet.is_empty() || packet.len() > usize::from(grant.mtu) {
         return Some("empty_or_oversized_packet");
     }
     // The transport performs full header/protocol checks. Check lengths and
     // address policy again at the TUN boundary, without parsing packet payloads.
-    let (source, destination): (IpAddr, IpAddr) = match packet[0] >> 4 {
-        4 if packet.len() >= 20
-            && packet[0] & 15 == 5
-            && usize::from(u16::from_be_bytes([packet[2], packet[3]])) == packet.len() =>
-        {
-            (
-                Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]).into(),
-                Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]).into(),
-            )
-        }
-        6 if packet.len() >= 40
-            && usize::from(u16::from_be_bytes([packet[4], packet[5]])) + 40 == packet.len() =>
-        {
-            (
-                Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("checked IPv6 header"))
-                    .into(),
-                Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("checked IPv6 header"))
-                    .into(),
-            )
-        }
-        _ => return Some("malformed_ip_header"),
+    let Some((source, destination)) = packet_addresses(packet) else {
+        return Some("malformed_ip_header");
     };
     if from_client {
         if source != grant.client_address.addr() {
             Some("source_outside_assigned_address")
-        } else if !grant
-            .routes
-            .iter()
-            .any(|route| route.contains(&destination))
-        {
+        } else if !grant.advertises(destination) {
             Some("destination_outside_advertised_routes")
         } else {
             None
@@ -788,7 +938,7 @@ fn packet_drop_reason(packet: &[u8], grant: &IpGrant, from_client: bool) -> Opti
     } else {
         if destination != grant.client_address.addr() {
             Some("destination_not_assigned_to_connector")
-        } else if !grant.routes.iter().any(|route| route.contains(&source)) {
+        } else if !grant.advertises(source) {
             Some("source_outside_advertised_routes")
         } else {
             None
@@ -814,10 +964,101 @@ mod tests {
                 client_address: "192.0.2.2/32".parse().unwrap(),
                 gateway_address: "192.0.2.1/32".parse().unwrap(),
                 routes: vec!["10.78.0.0/24".parse().unwrap()],
+                peer_routes: vec![],
                 interface_name: "dtun0".into(),
                 mtu: 1280,
             }],
         }
+    }
+
+    fn peer_config() -> IpConfig {
+        let mut cfg = config();
+        cfg.grants[0].peer_routes = vec!["192.0.2.3/32".parse().unwrap()];
+        cfg.grants.push(IpGrant {
+            network: "local-vpc".into(),
+            peer: iroh::SecretKey::from_bytes(&[8; 32]).public(),
+            client_address: "192.0.2.3/32".parse().unwrap(),
+            gateway_address: "192.0.2.4/32".parse().unwrap(),
+            routes: vec!["10.78.0.0/24".parse().unwrap()],
+            peer_routes: vec!["192.0.2.2/32".parse().unwrap()],
+            interface_name: "dtun1".into(),
+            mtu: 1280,
+        });
+        cfg
+    }
+
+    fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> [u8; 20] {
+        let mut packet = [0; 20];
+        packet[0] = 0x45;
+        packet[3] = 20;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    #[test]
+    fn peer_routes_are_validated_and_advertised() {
+        let cfg = peer_config();
+        cfg.validate().unwrap();
+        let grants = cfg.protocol_grants().unwrap();
+        assert_eq!(
+            grants[0]
+                .routes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["10.78.0.0/24", "192.0.2.3/32"]
+        );
+
+        let mut invalid = cfg.clone();
+        invalid.grants[0].peer_routes = vec!["192.0.2.99/32".parse().unwrap()];
+        assert!(invalid.validate().is_err());
+        let mut invalid = cfg.clone();
+        invalid.grants[0].peer_routes = vec!["192.0.2.0/24".parse().unwrap()];
+        assert!(invalid.validate().is_err());
+        let mut invalid = cfg;
+        invalid.grants[1].network = "other-vpc".into();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn peer_router_forwards_only_authorized_active_destinations() {
+        let cfg = peer_config();
+        let router = PeerRouter::new(&cfg);
+        let source = "192.0.2.2".parse().unwrap();
+        let destination = "192.0.2.3".parse().unwrap();
+        let packet = ipv4_packet([192, 0, 2, 2], [192, 0, 2, 3]);
+
+        assert!(!router.forward(source, destination, &packet));
+        let (registration, mut received) = router.register(destination);
+        assert!(router.forward(source, destination, &packet));
+        assert_eq!(received.try_recv().unwrap(), packet);
+        assert!(!router.forward(destination, destination, &packet));
+        drop(registration);
+        assert!(!router.forward(source, destination, &packet));
+
+        // Dropping an old registration cannot remove a newer session that
+        // reconnected using the same assigned address.
+        let (old, _) = router.register(destination);
+        let (_current, mut current_received) = router.register(destination);
+        drop(old);
+        assert!(router.forward(source, destination, &packet));
+        assert_eq!(current_received.try_recv().unwrap(), packet);
+    }
+
+    #[test]
+    fn packet_policy_allows_peer_routes_without_weakening_source_checks() {
+        let cfg = peer_config();
+        let first = &cfg.grants[0];
+        let second = &cfg.grants[1];
+        let packet = ipv4_packet([192, 0, 2, 2], [192, 0, 2, 3]);
+        assert!(packet_allowed(&packet, first, true));
+        assert!(packet_allowed(&packet, second, false));
+
+        let spoofed = ipv4_packet([192, 0, 2, 9], [192, 0, 2, 3]);
+        assert!(!packet_allowed(&spoofed, first, true));
+        let unrelated = ipv4_packet([192, 0, 2, 2], [192, 0, 2, 9]);
+        assert!(!packet_allowed(&unrelated, first, true));
     }
 
     #[test]

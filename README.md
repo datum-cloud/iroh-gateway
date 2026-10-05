@@ -103,6 +103,13 @@ VPC workloads can return traffic to a Connector without a platform route for
 each Connector address. NAT matches only the Connector address and explicitly
 approved VPC routes; workload network policies still apply. VPC workloads see
 the gateway's VPC address as the source, not the Connector's overlay address.
+An IP grant may separately include `peer_routes`, containing only `/32` or
+`/128` addresses assigned to other grants on the same named network. Those
+routes are advertised to the Connector and forwarded directly to the active
+destination session; they never enter the TUN or NAT rules. A missing or slow
+destination is dropped rather than falling through to the VPC interface. The
+Connect controller populates this list only when `ConnectGateway.spec.peerRouting`
+is enabled. VPC and peer routes together are limited to 32 per grant.
 Preserving Connector source addresses requires control-plane route advertisement
 and is not implemented by this prototype. Do not grant these capabilities to a
 general-purpose workload.
