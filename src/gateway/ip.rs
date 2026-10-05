@@ -582,7 +582,7 @@ async fn session_inner(
             Ok(Ok(tun)) => tun,
             failed => {
                 let kind = match failed { Ok(Err(error)) => error.kind(), _ => io::ErrorKind::TimedOut };
-                metrics.errors.fetch_add(1, Ordering::Relaxed); tracing::warn!(%peer, %network, interface=%grant.interface_name, error_kind=?kind, stage="ip_tun_setup", "CONNECT-IP gateway TUN setup failed"); session.cancel(); let _ = ready.send(false); return grant.interface_name;
+                metrics.errors.fetch_add(1, Ordering::Relaxed); tracing::warn!(%peer, %network, %session_id, interface=%grant.interface_name, error_kind=?kind, stage="ip_tun_setup", "CONNECT-IP gateway TUN setup failed"); session.cancel(); let _ = ready.send(false); return grant.interface_name;
             }
         }
     };
@@ -590,12 +590,12 @@ async fn session_inner(
         _ = cancel.cancelled() => { session.cancel(); let _ = ready.send(false); return grant.interface_name; }
         result = EgressNat::create(&grant, tun.name()) => match result {
             Ok(nat) => {
-                tracing::info!(%peer, %network, interface=%tun.name(), client_address=%grant.client_address, routes=?grant.routes, family=%nat.family, stage="ip_nat_ready", "CONNECT-IP VPC return path ready");
+                tracing::info!(%peer, %network, %session_id, interface=%tun.name(), client_address=%grant.client_address, routes=?grant.routes, family=%nat.family, stage="ip_nat_ready", "CONNECT-IP VPC return path ready");
                 nat
             },
             Err(error) => {
                 metrics.errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(%peer, %network, interface=%tun.name(), %error, stage="ip_nat_setup", "CONNECT-IP VPC return path setup failed");
+                tracing::warn!(%peer, %network, %session_id, interface=%tun.name(), %error, stage="ip_nat_setup", "CONNECT-IP VPC return path setup failed");
                 session.cancel();
                 let _ = ready.send(false);
                 return grant.interface_name;
@@ -605,7 +605,7 @@ async fn session_inner(
     if ready.send(true).is_err() {
         session.cancel();
         if let Err(error) = nat.remove().await {
-            tracing::warn!(%peer, %network, %error, stage="ip_nat_cleanup", "CONNECT-IP VPC return path cleanup failed");
+            tracing::warn!(%peer, %network, %session_id, %error, stage="ip_nat_cleanup", "CONNECT-IP VPC return path cleanup failed");
         }
         return grant.interface_name;
     }
@@ -613,9 +613,10 @@ async fn session_inner(
     let _active_guard = ActiveSession(metrics.clone(), grant.interface_name.clone());
     metrics.opened.fetch_add(1, Ordering::Relaxed);
     let initial_stats = session.stats();
-    tracing::info!(%peer, %network, interface=%tun.name(), delivery_mode=initial_stats.delivery_mode,
+    tracing::info!(%peer, %network, %session_id, interface=%tun.name(), delivery_mode=initial_stats.delivery_mode,
         configured_mtu=grant.mtu, effective_datagram_ip_capacity=initial_stats.effective_datagram_ip_capacity,
         "CONNECT-IP gateway session ready");
+    let session_started = tokio::time::Instant::now();
     let mut protocol_metrics = ProtocolMetrics {
         session: &session,
         metrics: &metrics,
@@ -629,13 +630,15 @@ async fn session_inner(
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buffer = vec![0; usize::from(grant.mtu)];
     let mut failure = None;
+    let close_reason;
     let (mut packets_to_vpc, mut packets_from_vpc) = (0u64, 0u64);
+    let (mut bytes_to_vpc, mut bytes_from_vpc) = (0u64, 0u64);
     let (mut policy_drops_to_vpc, mut policy_drops_from_vpc) = (0u64, 0u64);
     let mut policy_drop_reasons = HashMap::<&'static str, u64>::new();
     let (mut last_to_vpc_at_ms, mut last_from_vpc_at_ms) = (None, None);
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => { close_reason = "gateway_shutdown"; break; },
             _ = telemetry_tick.tick() => protocol_metrics.flush(),
             _ = health_tick.tick() => {
                 let stats = session.stats();
@@ -645,11 +648,13 @@ async fn session_inner(
                         Err(error) => (None, None, Some(error.to_string())),
                     };
                 let health_span = tracing::info_span!("connect_ip.health_snapshot", %peer, %network, %session_id);
-                health_span.in_scope(|| tracing::info!(%peer, %network, interface=%tun.name(),
+                health_span.in_scope(|| tracing::info!(%peer, %network, %session_id, interface=%tun.name(),
                     quic_datagrams_received=stats.datagrams_received,
                     quic_datagrams_sent=stats.datagrams_sent,
                     packets_injected_into_vpc=packets_to_vpc,
                     packets_returned_from_vpc=packets_from_vpc,
+                    bytes_injected_into_vpc=bytes_to_vpc,
+                    bytes_returned_from_vpc=bytes_from_vpc,
                     policy_drops_to_vpc, policy_drops_from_vpc,
                     policy_drop_reasons=?policy_drop_reasons,
                     nat_postrouting_packets, nat_postrouting_bytes,
@@ -661,23 +666,28 @@ async fn session_inner(
                     stage="connect_ip_health", "CONNECT-IP gateway directional health snapshot"));
             },
             packet = session.recv() => {
-                let Some(packet) = packet else { break; };
+                let Some(packet) = packet else {
+                    failure = session.last_error();
+                    close_reason = if failure.is_some() { "transport_error" } else { "peer_closed" };
+                    break;
+                };
                 if let Some(reason) = packet_drop_reason(&packet, &grant, true) {
                     metrics.dropped.fetch_add(1, Ordering::Relaxed);
                     policy_drops_to_vpc += 1;
                     *policy_drop_reasons.entry(reason).or_default() += 1;
                     continue;
                 }
-                let result = tokio::select! { _ = cancel.cancelled() => break, result = tun.write_packet(&packet) => result };
-                if let Err(error) = result { failure = Some(format!("TUN write failed: {}", error.kind())); break; }
+                let result = tokio::select! { _ = cancel.cancelled() => { close_reason = "gateway_shutdown"; break; }, result = tun.write_packet(&packet) => result };
+                if let Err(error) = result { close_reason = "tun_write_failed"; failure = Some(format!("TUN write failed: {}", error.kind())); break; }
                 metrics.injected_packets.fetch_add(1, Ordering::Relaxed); metrics.injected_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
                 packets_to_vpc += 1;
+                bytes_to_vpc = bytes_to_vpc.saturating_add(packet.len() as u64);
                 last_to_vpc_at_ms = Some(unix_time_ms());
             }
             received = tun.read_packet(&mut buffer) => {
                 let length = match received {
-                    Ok(0) => { failure = Some("TUN read returned end of file".to_owned()); break; },
-                    Err(error) => { failure = Some(format!("TUN read failed: {}", error.kind())); break; },
+                    Ok(0) => { close_reason = "tun_read_eof"; failure = Some("TUN read returned end of file".to_owned()); break; },
+                    Err(error) => { close_reason = "tun_read_failed"; failure = Some(format!("TUN read failed: {}", error.kind())); break; },
                     Ok(length) => length
                 };
                 if let Some(reason) = packet_drop_reason(&buffer[..length], &grant, false) {
@@ -686,18 +696,19 @@ async fn session_inner(
                     *policy_drop_reasons.entry(reason).or_default() += 1;
                     continue;
                 }
-                let result = tokio::select! { _ = cancel.cancelled() => break, result = session.send(buffer[..length].to_vec()) => result };
+                let result = tokio::select! { _ = cancel.cancelled() => { close_reason = "gateway_shutdown"; break; }, result = session.send(buffer[..length].to_vec()) => result };
                 match result {
                     Ok(()) => {
                         metrics.returned_packets.fetch_add(1, Ordering::Relaxed);
                         metrics.returned_bytes.fetch_add(length as u64, Ordering::Relaxed);
                         packets_from_vpc += 1;
+                        bytes_from_vpc = bytes_from_vpc.saturating_add(length as u64);
                         last_from_vpc_at_ms = Some(unix_time_ms());
                     }
                     // IpSession::send already counts these drops; the periodic
                     // delta collector records them once in gateway metrics.
                     Err(ip::Error::InvalidPacket | ip::Error::PacketTooLarge | ip::Error::AddressPolicy) => { tracing::debug!(%peer, %network, reason="packet_policy", "CONNECT-IP packet dropped"); }
-                    Err(error) => { failure = Some(error.to_string()); break; }
+                    Err(error) => { close_reason = "datagram_send_failed"; failure = Some(error.to_string()); break; }
                 }
             }
         }
@@ -707,18 +718,25 @@ async fn session_inner(
     if let Err(error) = nat.remove().await {
         tracing::warn!(%peer, %network, %error, stage="ip_nat_cleanup", "CONNECT-IP VPC return path cleanup failed");
     } else {
-        tracing::info!(%peer, %network, stage="ip_nat_closed", "CONNECT-IP VPC return path removed");
+        tracing::info!(%peer, %network, %session_id, stage="ip_nat_closed", "CONNECT-IP VPC return path removed");
     }
     let final_stats = session.stats();
-    if let Some(error) = session.last_error().or(failure) {
+    let failure = session.last_error().or(failure);
+    if let Some(error) = failure.as_deref() {
         metrics.errors.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(%peer, %network, interface=%tun.name(), delivery_mode=final_stats.delivery_mode,
+        tracing::warn!(%peer, %network, %session_id, interface=%tun.name(), delivery_mode=final_stats.delivery_mode,
             configured_mtu=grant.mtu, effective_datagram_ip_capacity=final_stats.effective_datagram_ip_capacity,
             %error, "CONNECT-IP gateway session failed");
     }
-    tracing::info!(%peer, %network, interface=%tun.name(), delivery_mode=final_stats.delivery_mode,
+    tracing::info!(%peer, %network, %session_id, interface=%tun.name(),
+        duration_ms=session_started.elapsed().as_millis() as u64, close_reason,
+        packets_injected_into_vpc=packets_to_vpc, packets_returned_from_vpc=packets_from_vpc,
+        bytes_injected_into_vpc=bytes_to_vpc, bytes_returned_from_vpc=bytes_from_vpc,
+        policy_drops_to_vpc, policy_drops_from_vpc,
+        delivery_mode=final_stats.delivery_mode,
         datagrams_sent=final_stats.datagrams_sent, datagrams_received=final_stats.datagrams_received,
-        mtu_errors=final_stats.mtu_errors, "CONNECT-IP gateway session closed");
+        mtu_errors=final_stats.mtu_errors, stage="connect_ip_session_closed",
+        "CONNECT-IP gateway session closed");
     drop(protocol_metrics);
     grant.interface_name
 }

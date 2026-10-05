@@ -223,14 +223,18 @@ Datagrams are not retried or made reliable by the gateway.
 
 ## Metrics
 
-When you set `--metrics-port`, the gateway exposes Prometheus metrics at `/metrics`.
-The endpoint reports:
+Set both `--metrics-addr` and `--metrics-port` to expose Prometheus metrics at
+`/metrics`. Bind to a private interface and restrict scrape access with the
+workload network policy. The endpoint reports:
 
 - Request counts by type (tunnel vs origin) and source (TCP vs UDS)
 - Denied request counts by reason (missing header, invalid endpoint ID, etc.)
 - HTTP error response counts by status code
 - iroh connection counts (direct vs relay, current vs historical)
 - Bytes sent and received through the iroh magicsock
+- CONNECT-IP active/opened sessions, transport errors, policy drops, datagram
+  counts, MTU errors, and minimum active datagram capacity
+- CONNECT-IP packets and bytes injected into the VPC and returned from it
 
 ## Export OpenTelemetry traces
 
@@ -242,7 +246,10 @@ URL. The gateway appends `/v1/traces`. You can instead set
 `OTEL_EXPORTER_OTLP_ENDPOINT` to the base URL. Restart the gateway after you
 change its environment.
 
-The gateway propagates W3C trace context for CONNECT-IP sessions. Trace data can
+The gateway propagates W3C trace context for CONNECT-IP sessions. Session IDs
+match between the client and gateway logs and trace spans. Gateway health
+snapshots report directional packet and byte totals; session-close events report
+duration and a close reason. Trace data can
 include project network names, peer or endpoint identifiers, interface names,
 routes, request IDs, and connection diagnostics. It does not include tunneled
 packet payloads. Send traces only to a collector you trust, and apply your usual
