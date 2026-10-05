@@ -53,4 +53,5 @@ tempfile = "3"
 debug = "line-tables-only"
 
 [patch.crates-io]
-h3 = { path = "../connect/connect-lib/transport/vendor/h3" }
+# h3 0.0.8 predates CONNECT-IP support; drop this pin after hyperium/h3#273 is released.
+h3 = { git = "https://github.com/hyperium/h3", rev = "0e54a16df76102809ad99b03663b559dfc203917" }

@@ -1469,6 +1469,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
+source = "git+https://github.com/hyperium/h3?rev=0e54a16df76102809ad99b03663b559dfc203917#0e54a16df76102809ad99b03663b559dfc203917"
 dependencies = [
  "bytes",
  "fastrand",
