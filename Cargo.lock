@@ -2029,6 +2029,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "axum",
+ "bytes",
  "clap",
  "color-backtrace",
  "connect-ip-adapter",
@@ -2047,7 +2048,9 @@ dependencies = [
  "n0-error",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
+ "prost",
  "reqwest 0.12.28",
  "rustls",
  "serde",

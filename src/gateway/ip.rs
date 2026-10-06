@@ -16,8 +16,12 @@ use std::{
 use tokio::process::Command;
 
 use connect_ip_adapter::{IpNet, Tun};
-use connect_transport::ip::{self, Grant, Incoming};
+use connect_transport::ip::{
+    self, Grant, Incoming, TelemetryBatch, TelemetryPolicy, TelemetrySignal,
+};
+use hyper::StatusCode;
 use iroh::{Endpoint, EndpointId};
+use prost::Message;
 use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +47,21 @@ pub(crate) struct IpGrant {
     pub interface_name: String,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    #[serde(default)]
+    pub telemetry: Option<TelemetryGrant>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TelemetryGrant {
+    #[serde(default)]
+    pub traces: bool,
+    #[serde(default)]
+    pub metrics: bool,
+    pub project_id: String,
+    pub connector_id: String,
+    pub binding_id: String,
+    pub gateway_id: String,
 }
 
 impl IpGrant {
@@ -163,6 +182,22 @@ impl IpConfig {
             {
                 return Err(invalid("invalid IP network name"));
             }
+            if let Some(telemetry) = &grant.telemetry {
+                if (!telemetry.traces && !telemetry.metrics)
+                    || [
+                        &telemetry.project_id,
+                        &telemetry.connector_id,
+                        &telemetry.binding_id,
+                        &telemetry.gateway_id,
+                    ]
+                    .iter()
+                    .any(|value| value.is_empty() || value.len() > 128)
+                {
+                    return Err(invalid(
+                        "telemetry grants require an enabled signal and bounded canonical tenant identifiers",
+                    ));
+                }
+            }
             connect_ip_adapter::validate(
                 &grant.interface_name,
                 grant.gateway_address,
@@ -227,6 +262,14 @@ impl IpConfig {
                         .map(|route| route.to_string().parse().map_err(io::Error::other))
                         .collect::<io::Result<_>>()?,
                     mtu: grant.mtu,
+                    telemetry: grant
+                        .telemetry
+                        .as_ref()
+                        .map(|policy| TelemetryPolicy {
+                            traces: policy.traces,
+                            metrics: policy.metrics,
+                        })
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -344,6 +387,10 @@ pub(super) struct IpMetrics {
     datagrams_sent: AtomicU64,
     datagrams_received: AtomicU64,
     mtu_errors: AtomicU64,
+    telemetry_batches: AtomicU64,
+    telemetry_bytes: AtomicU64,
+    telemetry_forwarded: AtomicU64,
+    telemetry_failed: AtomicU64,
     // Interface names are unique for active grants. Keep a minimum across all
     // sessions instead of exposing whichever session happened to update last.
     capacities: Mutex<HashMap<String, usize>>,
@@ -417,6 +464,18 @@ impl IpMetrics {
                 &self.datagrams_received,
             ),
             ("mtu_errors_total", "counter", &self.mtu_errors),
+            (
+                "telemetry_batches_total",
+                "counter",
+                &self.telemetry_batches,
+            ),
+            ("telemetry_bytes_total", "counter", &self.telemetry_bytes),
+            (
+                "telemetry_forwarded_total",
+                "counter",
+                &self.telemetry_forwarded,
+            ),
+            ("telemetry_failed_total", "counter", &self.telemetry_failed),
         ] {
             let _ = writeln!(
                 output,
@@ -479,6 +538,7 @@ pub(super) async fn serve(
     let owned_cancel = cancel.child_token();
     let _guard = owned_cancel.clone().drop_guard();
     let (sender, mut incoming) = mpsc::channel::<Incoming>(64);
+    let telemetry_forwarder = OtlpForwarder::from_env(metrics.clone())?;
     let protocol = ip::serve(
         endpoint,
         config.protocol_grants()?,
@@ -503,13 +563,195 @@ pub(super) async fn serve(
                 let grant = config.grants.iter().find(|grant| grant.peer == request.peer && grant.network == request.network);
                 let Some(grant) = grant else { request.session.cancel(); let _ = request.ready.send(false); continue; };
                 if !active.insert(grant.interface_name.clone()) { request.session.cancel(); let _ = request.ready.send(false); metrics.errors.fetch_add(1, Ordering::Relaxed); continue; }
-                sessions.spawn(session(request, grant.clone(), metrics.clone(), peer_router.clone(), owned_cancel.child_token()));
+                sessions.spawn(session(request, grant.clone(), metrics.clone(), peer_router.clone(), telemetry_forwarder.clone(), owned_cancel.child_token()));
             }
         }
     };
     owned_cancel.cancel();
     while sessions.join_next().await.is_some() {}
     result
+}
+
+#[derive(Clone)]
+struct OtlpForwarder {
+    endpoint: Option<String>,
+    client: reqwest::Client,
+    metrics: Arc<IpMetrics>,
+}
+
+impl OtlpForwarder {
+    fn from_env(metrics: Arc<IpMetrics>) -> io::Result<Self> {
+        let endpoint = std::env::var("DATUM_CONNECT_IN_BAND_OTLP_ENDPOINT")
+            .ok()
+            .map(|value| value.trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            endpoint,
+            client,
+            metrics,
+        })
+    }
+
+    async fn forward(&self, batch: TelemetryBatch, grant: &IpGrant) {
+        self.metrics
+            .telemetry_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .telemetry_bytes
+            .fetch_add(batch.body.len() as u64, Ordering::Relaxed);
+        let Some(policy) = &grant.telemetry else {
+            self.metrics
+                .telemetry_failed
+                .fetch_add(1, Ordering::Relaxed);
+            batch.respond(StatusCode::FORBIDDEN, bytes::Bytes::new());
+            return;
+        };
+        if !curated_telemetry(batch.signal, &batch.body) {
+            self.metrics
+                .telemetry_failed
+                .fetch_add(1, Ordering::Relaxed);
+            batch.respond(StatusCode::BAD_REQUEST, bytes::Bytes::new());
+            return;
+        }
+        let Some(endpoint) = &self.endpoint else {
+            self.metrics
+                .telemetry_failed
+                .fetch_add(1, Ordering::Relaxed);
+            batch.respond(StatusCode::SERVICE_UNAVAILABLE, bytes::Bytes::new());
+            return;
+        };
+        let path = match batch.signal {
+            TelemetrySignal::Traces => "/v1/traces",
+            TelemetrySignal::Metrics => "/v1/metrics",
+        };
+        let result = self
+            .client
+            .post(format!("{endpoint}{path}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
+            .header("x-datum-project-id", &policy.project_id)
+            .header("x-datum-connector-id", &policy.connector_id)
+            .header("x-datum-binding-id", &policy.binding_id)
+            .header("x-datum-gateway-id", &policy.gateway_id)
+            .body(batch.body.clone())
+            .send()
+            .await;
+        match result {
+            Ok(response) => {
+                let status = StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let body = response.bytes().await.unwrap_or_default();
+                let body = if body.len() <= 256 * 1024 {
+                    body
+                } else {
+                    bytes::Bytes::new()
+                };
+                if status.is_success() {
+                    self.metrics
+                        .telemetry_forwarded
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.metrics
+                        .telemetry_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                batch.respond(status, body);
+            }
+            Err(error) => {
+                self.metrics
+                    .telemetry_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error=%error, signal=?batch.signal, stage="in_band_telemetry_forward", "in-band OTLP forwarding failed");
+                batch.respond(StatusCode::SERVICE_UNAVAILABLE, bytes::Bytes::new());
+            }
+        }
+    }
+}
+
+fn curated_telemetry(signal: TelemetrySignal, body: &[u8]) -> bool {
+    const RESOURCE_ATTRIBUTES: &[&str] = &[
+        "service.name",
+        "service.namespace",
+        "datum.project",
+        "datum.network",
+        "datum.session_id",
+    ];
+    const SPAN_ATTRIBUTES: &[&str] = &[
+        "project",
+        "datum.project",
+        "network",
+        "gateway",
+        "session_id",
+        "connector",
+    ];
+    const SPANS: &[&str] = &[
+        "connect_ip.client_session",
+        "connect_ip.health_snapshot",
+        "connect_ip.attachment",
+    ];
+    const METRICS: &[&str] = &[
+        "datum.connect.quic.datagrams.sent",
+        "datum.connect.quic.datagrams.received",
+        "datum.connect.packets.sent",
+        "datum.connect.packets.received",
+        "datum.connect.packets.dropped",
+        "datum.connect.protocol.errors",
+        "datum.connect.path.ip_capacity",
+    ];
+    let allowed_attributes = |attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+                              allowed: &[&str]| {
+        attributes
+            .iter()
+            .all(|attribute| allowed.contains(&attribute.key.as_str()))
+    };
+    match signal {
+        TelemetrySignal::Traces => {
+            use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+            let Ok(request) = ExportTraceServiceRequest::decode(body) else {
+                return false;
+            };
+            !request.resource_spans.is_empty()
+                && request.resource_spans.iter().all(|resource| {
+                    resource.resource.as_ref().is_none_or(|value| {
+                        allowed_attributes(&value.attributes, RESOURCE_ATTRIBUTES)
+                    }) && resource.scope_spans.iter().all(|scope| {
+                        scope.spans.iter().all(|span| {
+                            SPANS.contains(&span.name.as_str())
+                                && allowed_attributes(&span.attributes, SPAN_ATTRIBUTES)
+                                && span.events.is_empty()
+                                && span.links.is_empty()
+                        })
+                    })
+                })
+        }
+        TelemetrySignal::Metrics => {
+            use opentelemetry_proto::tonic::{
+                collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::metric,
+            };
+            let Ok(request) = ExportMetricsServiceRequest::decode(body) else {
+                return false;
+            };
+            !request.resource_metrics.is_empty()
+                && request.resource_metrics.iter().all(|resource| {
+                    resource.resource.as_ref().is_none_or(|value| {
+                        allowed_attributes(&value.attributes, RESOURCE_ATTRIBUTES)
+                    }) && resource.scope_metrics.iter().all(|scope| {
+                        scope.metrics.iter().all(|metric| {
+                            METRICS.contains(&metric.name.as_str())
+                                && matches!(
+                                    &metric.data,
+                                    Some(metric::Data::Gauge(gauge))
+                                        if !gauge.data_points.is_empty()
+                                            && gauge.data_points.iter().all(|point| point.attributes.is_empty())
+                                )
+                        })
+                    })
+                })
+        }
+    }
 }
 
 /// Install narrowly scoped stateful source NAT so VPC workloads can return
@@ -670,6 +912,7 @@ async fn session(
     grant: IpGrant,
     metrics: Arc<IpMetrics>,
     peer_router: Arc<PeerRouter>,
+    telemetry_forwarder: OtlpForwarder,
     cancel: CancellationToken,
 ) -> String {
     let span = info_span!(
@@ -679,9 +922,16 @@ async fn session(
         session_id = %incoming.session_id
     );
     let _ = span.set_parent(incoming.trace_context.clone());
-    session_inner(incoming, grant, metrics, peer_router, cancel)
-        .instrument(span)
-        .await
+    session_inner(
+        incoming,
+        grant,
+        metrics,
+        peer_router,
+        telemetry_forwarder,
+        cancel,
+    )
+    .instrument(span)
+    .await
 }
 
 async fn session_inner(
@@ -689,6 +939,7 @@ async fn session_inner(
     grant: IpGrant,
     metrics: Arc<IpMetrics>,
     peer_router: Arc<PeerRouter>,
+    telemetry_forwarder: OtlpForwarder,
     cancel: CancellationToken,
 ) -> String {
     let Incoming {
@@ -697,6 +948,7 @@ async fn session_inner(
         session_id,
         trace_context: _,
         session,
+        mut telemetry,
         ready,
     } = incoming;
     let client_routes = [grant.client_address];
@@ -754,6 +1006,7 @@ async fn session_inner(
     let mut health_tick = tokio::time::interval(Duration::from_secs(10));
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buffer = vec![0; usize::from(grant.mtu)];
+    let mut telemetry_tasks = JoinSet::new();
     let mut failure = None;
     let close_reason;
     let (mut packets_to_vpc, mut packets_from_vpc) = (0u64, 0u64);
@@ -765,6 +1018,14 @@ async fn session_inner(
         tokio::select! {
             _ = cancel.cancelled() => { close_reason = "gateway_shutdown"; break; },
             _ = telemetry_tick.tick() => protocol_metrics.flush(),
+            request = telemetry.recv(), if telemetry_tasks.is_empty() => {
+                if let Some(batch) = request {
+                    let forwarder = telemetry_forwarder.clone();
+                    let telemetry_grant = grant.clone();
+                    telemetry_tasks.spawn(async move { forwarder.forward(batch, &telemetry_grant).await; });
+                }
+            },
+            _ = telemetry_tasks.join_next(), if !telemetry_tasks.is_empty() => {},
             _ = health_tick.tick() => {
                 let stats = session.stats();
                 let (nat_postrouting_packets, nat_postrouting_bytes, nat_counter_error) =
@@ -863,6 +1124,7 @@ async fn session_inner(
             }
         }
     }
+    telemetry_tasks.abort_all();
     session.cancel();
     protocol_metrics.flush();
     if let Err(error) = nat.remove().await {
@@ -967,6 +1229,7 @@ mod tests {
                 peer_routes: vec![],
                 interface_name: "dtun0".into(),
                 mtu: 1280,
+                telemetry: None,
             }],
         }
     }
@@ -983,6 +1246,7 @@ mod tests {
             peer_routes: vec!["192.0.2.2/32".parse().unwrap()],
             interface_name: "dtun1".into(),
             mtu: 1280,
+            telemetry: None,
         });
         cfg
     }
@@ -1019,6 +1283,81 @@ mod tests {
         let mut invalid = cfg;
         invalid.grants[1].network = "other-vpc".into();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn telemetry_grants_are_explicit_and_propagate_only_approved_signals() {
+        let mut cfg = config();
+        cfg.grants[0].telemetry = Some(TelemetryGrant {
+            traces: true,
+            metrics: false,
+            project_id: "project-id".into(),
+            connector_id: "connector-id".into(),
+            binding_id: "binding-id".into(),
+            gateway_id: "gateway-id".into(),
+        });
+        cfg.validate().unwrap();
+        let grants = cfg.protocol_grants().unwrap();
+        assert_eq!(
+            grants[0].telemetry,
+            TelemetryPolicy {
+                traces: true,
+                metrics: false
+            }
+        );
+
+        cfg.grants[0].telemetry.as_mut().unwrap().project_id.clear();
+        assert!(cfg.validate().is_err());
+        cfg.grants[0].telemetry.as_mut().unwrap().project_id = "project-id".into();
+        cfg.grants[0].telemetry.as_mut().unwrap().traces = false;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn telemetry_payloads_are_validated_against_the_product_allowlist() {
+        use opentelemetry_proto::tonic::{
+            collector::metrics::v1::ExportMetricsServiceRequest,
+            metrics::v1::{
+                Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+                number_data_point,
+            },
+        };
+        let mut request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "datum.connect.packets.sent".into(),
+                        description: String::new(),
+                        unit: "1".into(),
+                        metadata: Vec::new(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes: Vec::new(),
+                                start_time_unix_nano: 0,
+                                time_unix_nano: 1,
+                                exemplars: Vec::new(),
+                                flags: 0,
+                                value: Some(number_data_point::Value::AsInt(1)),
+                            }],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        assert!(curated_telemetry(
+            TelemetrySignal::Metrics,
+            &request.encode_to_vec()
+        ));
+        request.resource_metrics[0].scope_metrics[0].metrics[0].name = "host.passwords".into();
+        assert!(!curated_telemetry(
+            TelemetrySignal::Metrics,
+            &request.encode_to_vec()
+        ));
+        assert!(!curated_telemetry(TelemetrySignal::Traces, b"not protobuf"));
     }
 
     #[test]

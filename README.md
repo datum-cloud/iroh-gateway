@@ -263,6 +263,16 @@ packet payloads. Send traces only to a collector you trust, and apply your usual
 retention and access controls. Export requests have a three-second timeout; a
 collector outage does not stop packet forwarding.
 
+Connector telemetry forwarding is a separate opt-in path. Set
+`DATUM_CONNECT_IN_BAND_OTLP_ENDPOINT` to the platform collector's OTLP/HTTP
+base URL. This setting does not enable any Connector: its strict IP grant must
+contain a telemetry policy rendered from an opted-in binding, and the Connector
+must also request the capability locally. The gateway forwards `/v1/traces` and
+`/v1/metrics` with canonical project, Connector, binding, and gateway identity
+headers. Missing or unavailable ingestion returns a telemetry error without
+interrupting CONNECT-IP. The gateway decodes each OTLP request and rejects
+unknown span names, metric names, or attributes before forwarding it.
+
 ## Validate local Connect interoperability
 
 Use `scripts/connect-interop.py` to exercise the real gateway and Connect daemon
