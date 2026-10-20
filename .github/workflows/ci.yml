@@ -18,13 +18,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Cargo check
-        run: cargo check --locked
+        run: cargo check --workspace --locked
 
       - name: Cargo test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Cargo clippy
-        run: cargo clippy --all-features --all-targets --lib --bins --tests --benches --examples
+        run: cargo clippy --workspace --all-features --all-targets --lib --bins --tests --benches --examples
 
       - name: Cargo fmt
         run: cargo fmt --check
