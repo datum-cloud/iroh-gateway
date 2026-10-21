@@ -1,4 +1,4 @@
-FROM rust:1.91-bookworm AS builder
+FROM rust:1.91-trixie AS builder
 
 WORKDIR /app
 
@@ -9,7 +9,7 @@ ENV BUILD_IROH_SERVICES_API_KEY=${BUILD_IROH_SERVICES_API_KEY}
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
