@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "packet"]
+
 [package]
 name = "iroh-gateway"
 version = "0.1.0"
