@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   publish:
-    uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.9.0
+    uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.22.0
     with:
       image-name: iroh-gateway
     secrets: inherit
