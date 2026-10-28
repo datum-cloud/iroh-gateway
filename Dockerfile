@@ -1,6 +1,6 @@
 FROM rust:1.98-bookworm AS builder
 
-ARG CONNECT_REV=d2f4cc6ba32a949d8c446ec17b92e47b4d827681
+ARG CONNECT_REV=b22e2dd373e7ae7177707b6443ab47ea5151b860
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates git \
