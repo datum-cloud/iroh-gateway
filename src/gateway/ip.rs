@@ -19,6 +19,7 @@ use connect_ip_adapter::{IpNet, Tun};
 use connect_transport::ip::{self, Grant, Incoming};
 use iroh::{Endpoint, EndpointId};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
@@ -57,6 +58,17 @@ impl IpGrant {
 }
 fn default_mtu() -> u16 {
     1280
+}
+
+/// The SHA-256 digest of a configuration file's bytes, in lowercase hex, so a log shows which
+/// configuration was read.
+fn config_sha256(contents: &[u8]) -> String {
+    Sha256::digest(contents)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 impl IpConfig {
@@ -121,6 +133,8 @@ impl IpConfig {
         if contents.len() > 1024 * 1024 {
             return Err(invalid("IP grant file exceeds 1 MiB"));
         }
+        tracing::info!(path=%path.display(), config_sha256=%config_sha256(&contents), stage="ip_config_read",
+            "CONNECT-IP configuration file read");
         let config: Self = serde_json::from_slice(&contents)
             .map_err(|_| invalid("IP grant file is not valid strict JSON"))?;
         config.validate()?;
@@ -994,6 +1008,14 @@ mod tests {
         packet[12..16].copy_from_slice(&source);
         packet[16..20].copy_from_slice(&destination);
         packet
+    }
+
+    #[test]
+    fn config_sha256_is_the_file_digest() {
+        assert_eq!(
+            config_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
