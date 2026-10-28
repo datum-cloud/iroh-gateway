@@ -14,6 +14,7 @@ path = "src/main.rs"
 color-backtrace = ">=0.7.0, <0.7.3"
 askama = "0.15.1"
 axum = "0.7"
+base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 # Shared wire implementation; Dockerfile fetches the pinned Connect revision to /connect.
 connect-transport = { path = "../connect/connect-lib/transport", features = ["otel"] }
@@ -28,6 +29,7 @@ iroh-metrics = "1.0"
 iroh-proxy-utils = "0.3"
 iroh-relay = "1.0"
 iroh-services = "1.0"
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
 n0-error = { version = "1.0", features = ["anyhow"] }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-rustls"] }
@@ -47,6 +49,7 @@ tracing-opentelemetry = "0.32"
 libc = "0.2"
 
 [dev-dependencies]
+ring = "0.17.14"
 tempfile = "3"
 
 [profile.release]

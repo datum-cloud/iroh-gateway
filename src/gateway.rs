@@ -23,6 +23,7 @@ use tracing::info;
 mod ip;
 mod masque;
 mod metrics;
+mod token;
 mod udp;
 
 use self::metrics::{GatewayMetrics, MetricsHttpState, serve_metrics_http, shared_gateway_metrics};
