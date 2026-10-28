@@ -1,4 +1,5 @@
-//! Static, explicitly approved CONNECT-IP grants and Linux packet injection.
+//! Static, explicitly approved CONNECT-IP grants and Linux packet injection, and optional
+//! admission of devices that present a bearer token from a configured issuer.
 //! This prototype never enables host forwarding, installs default routes, or
 //! trusts a peer-supplied route/address assignment.
 use std::{
@@ -11,14 +12,17 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::process::Command;
+
+use super::token::{IssuerConfig, Verified, Verifier};
 
 use connect_ip_adapter::{IpNet, Tun};
 use connect_transport::ip::{self, Grant, Incoming};
 use iroh::{Endpoint, EndpointId};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
@@ -28,6 +32,282 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 #[serde(deny_unknown_fields)]
 pub(crate) struct IpConfig {
     pub grants: Vec<IpGrant>,
+    /// Admission of devices that present a bearer token instead of holding a grant. Off when
+    /// absent.
+    #[serde(default)]
+    pub token_admission: Option<TokenAdmission>,
+}
+
+/// Admits a device that presents a valid bearer token from a configured issuer. Its address is
+/// derived from the project, the network and both endpoint keys, as Connect derives a binding's
+/// address, and it may reach only `routes`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TokenAdmission {
+    /// The project this gateway serves; part of each derived address.
+    pub project: String,
+    /// The network a token-admitted device joins.
+    pub network: String,
+    /// The routes a token-admitted device may reach. IPv6 only, and none may cover all of
+    /// `fd00::/8`, where device addresses are derived. A device whose derived address falls inside
+    /// a route is refused.
+    pub routes: Vec<IpNet>,
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
+    /// The issuers whose tokens are accepted. With none, every token is refused, while static
+    /// grants keep working.
+    pub issuers: Vec<IssuerConfig>,
+}
+
+impl TokenAdmission {
+    fn validate(&self) -> io::Result<()> {
+        if self.project.is_empty() || self.project.len() > 253 {
+            return Err(invalid("token admission needs a project name"));
+        }
+        if !valid_network_name(&self.network) {
+            return Err(invalid("invalid token admission network name"));
+        }
+        let derived: IpNet = "fd00::/8".parse().map_err(io::Error::other)?;
+        if self.routes.is_empty()
+            || self.routes.len() > 32
+            || self
+                .routes
+                .iter()
+                .any(|route| route.addr().is_ipv4() || route.contains(&derived))
+        {
+            return Err(invalid(
+                "token admission routes must be 1 to 32 IPv6 routes, none covering fd00::/8",
+            ));
+        }
+        for (index, route) in self.routes.iter().enumerate() {
+            if self.routes[..index]
+                .iter()
+                .any(|other| route.contains(&other.network()) || other.contains(&route.network()))
+            {
+                return Err(invalid("overlapping IP routes are unsupported"));
+            }
+        }
+        if !(1280..=1500).contains(&self.mtu) {
+            return Err(invalid("token admission MTU must be 1280 to 1500"));
+        }
+        Verifier::new(&self.issuers)
+            .map(|_| ())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    }
+}
+
+fn valid_network_name(network: &str) -> bool {
+    !network.is_empty()
+        && network.len() <= 63
+        && network
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// A device's attachment, derived as Connect derives a binding's: the device's address, the
+/// gateway's address on the device's interface, and that interface's name.
+fn derived_attachment(
+    project: &str,
+    network: &str,
+    client: &EndpointId,
+    gateway: &EndpointId,
+) -> (Ipv6Addr, Ipv6Addr, String) {
+    let (client, gateway) = (client.to_string(), gateway.to_string());
+    let (first, second) = if gateway < client {
+        (&gateway, &client)
+    } else {
+        (&client, &gateway)
+    };
+    let address = |key: &str| {
+        let digest = attachment_digest(&[project, network, first, second, key]);
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[0] = 0xfd;
+        Ipv6Addr::from(bytes)
+    };
+    let label = attachment_digest(&[project, network, first, second]);
+    let interface = label[..7].iter().fold(String::from("d"), |mut name, byte| {
+        let _ = write!(name, "{byte:02x}");
+        name
+    });
+    (address(&client), address(&gateway), interface)
+}
+
+fn attachment_digest(parts: &[&str]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"datum-connect/peer-host/v1\0");
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_vec()
+}
+
+const PENDING_GRANT_TTL: Duration = Duration::from_secs(30);
+
+struct PendingGrant {
+    session_id: String,
+    grant: IpGrant,
+    admitted_at: Instant,
+    /// The token that admitted it, released if no session claims the grant.
+    token: Verified,
+}
+
+/// Decides token admission for CONNECT-IP requests that match no static grant, and holds each
+/// admitted grant until its session claims it.
+struct TokenAdmitter {
+    admission: TokenAdmission,
+    verifier: Verifier,
+    gateway: EndpointId,
+    pending: Mutex<HashMap<(EndpointId, String), PendingGrant>>,
+}
+
+impl TokenAdmitter {
+    fn new(admission: TokenAdmission, gateway: EndpointId) -> io::Result<Self> {
+        let verifier = Verifier::new(&admission.issuers)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            admission,
+            verifier,
+            gateway,
+            pending: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn admit(
+        &self,
+        peer: EndpointId,
+        network: &str,
+        session_id: &str,
+        proxy_authorization: Option<&str>,
+        now: u64,
+    ) -> Option<Grant> {
+        if network != self.admission.network {
+            return None;
+        }
+        let Some(token) = proxy_authorization.and_then(bearer_token) else {
+            tracing::info!(%peer, %network, %session_id, stage="ip_token_admission", "CONNECT-IP request carries no bearer token");
+            return None;
+        };
+        let verified = match self.verifier.verify(token, now) {
+            Ok(verified) => verified,
+            Err(reason) => {
+                tracing::warn!(%peer, %network, %session_id, %reason, stage="ip_token_admission", "CONNECT-IP token refused");
+                return None;
+            }
+        };
+        let grant = self.grant(peer, network, session_id, &verified);
+        if grant.is_none() {
+            self.verifier.release(&verified);
+        }
+        grant
+    }
+
+    /// The grant for a verified token, held until its session claims it. `None` refuses the request.
+    fn grant(
+        &self,
+        peer: EndpointId,
+        network: &str,
+        session_id: &str,
+        verified: &Verified,
+    ) -> Option<Grant> {
+        let admission = &self.admission;
+        let (client, gateway, interface_name) =
+            derived_attachment(&admission.project, network, &peer, &self.gateway);
+        if admission.routes.iter().any(|route| {
+            route.contains(&IpAddr::V6(client)) || route.contains(&IpAddr::V6(gateway))
+        }) {
+            tracing::warn!(%peer, %network, %session_id, stage="ip_token_admission", "CONNECT-IP derived address falls inside an advertised route");
+            return None;
+        }
+        let client_address = IpNet::new(IpAddr::V6(client), 128).ok()?;
+        let gateway_address = IpNet::new(IpAddr::V6(gateway), 128).ok()?;
+        let routes = admission
+            .routes
+            .iter()
+            .map(|route| route.to_string().parse().ok())
+            .collect::<Option<Vec<_>>>()?;
+        tracing::info!(%peer, %network, %session_id, issuer=%verified.issuer, stage="ip_token_admission",
+            "CONNECT-IP token accepted; the grant waits for its session");
+        let grant = IpGrant {
+            network: network.to_owned(),
+            peer,
+            client_address,
+            gateway_address,
+            routes: admission.routes.clone(),
+            peer_routes: Vec::new(),
+            interface_name,
+            mtu: admission.mtu,
+        };
+        self.expire_pending(Instant::now());
+        let replaced = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                (peer, network.to_owned()),
+                PendingGrant {
+                    session_id: session_id.to_owned(),
+                    grant,
+                    admitted_at: Instant::now(),
+                    token: verified.clone(),
+                },
+            );
+        if let Some(replaced) = replaced {
+            self.verifier.release(&replaced.token);
+        }
+        Some(Grant {
+            peer,
+            network: network.to_owned(),
+            address: IpAddr::V6(client),
+            routes,
+            mtu: admission.mtu,
+        })
+    }
+
+    /// Drops grants no session claimed in time, and releases their tokens. Runs on each admission.
+    fn expire_pending(&self, now: Instant) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|_, entry| {
+                let live = now.saturating_duration_since(entry.admitted_at) < PENDING_GRANT_TTL;
+                if !live {
+                    self.verifier.release(&entry.token);
+                }
+                live
+            });
+    }
+
+    /// Takes the grant admitted for this session, if any.
+    fn claim(&self, peer: EndpointId, network: &str, session_id: &str) -> Option<IpGrant> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let key = (peer, network.to_owned());
+        if pending
+            .get(&key)
+            .is_some_and(|entry| entry.session_id == session_id)
+        {
+            let entry = pending.remove(&key)?;
+            let verified = &entry.token;
+            tracing::info!(%peer, %network, %session_id, issuer=%verified.issuer,
+                subject=verified.subject.as_deref().unwrap_or(""), token_id=verified.token_id.as_deref().unwrap_or(""),
+                expires_at=verified.expires_at, client_address=%entry.grant.client_address,
+                routes=?entry.grant.routes, stage="ip_token_admission", "CONNECT-IP session admitted by token");
+            Some(entry.grant)
+        } else {
+            None
+        }
+    }
+}
+
+/// The token in a `Proxy-Authorization: Bearer <token>` value.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -65,6 +345,11 @@ impl IpConfig {
             .grants
             .iter()
             .flat_map(|grant| &grant.routes)
+            .chain(
+                self.token_admission
+                    .iter()
+                    .flat_map(|admission| &admission.routes),
+            )
             .any(|route| {
                 (route.addr().is_ipv4() && route.prefix_len() < 2)
                     || (route.addr().is_ipv6() && route.prefix_len() < 2)
@@ -82,6 +367,11 @@ impl IpConfig {
             underlay == grant.client_address.addr()
                 || underlay == grant.gateway_address.addr()
                 || grant.routes.iter().any(|route| route.contains(&underlay))
+        }) || self.token_admission.iter().any(|admission| {
+            admission
+                .routes
+                .iter()
+                .any(|route| route.contains(&underlay))
         }) {
             return Err(invalid(
                 "CONNECT-IP underlay bind must not overlap any grant's advertised routes or assigned client/gateway addresses",
@@ -130,6 +420,9 @@ impl IpConfig {
     fn validate(&self) -> io::Result<()> {
         if self.grants.len() > 64 {
             return Err(invalid("IP grants cannot contain more than 64 entries"));
+        }
+        if let Some(admission) = &self.token_admission {
+            admission.validate()?;
         }
         let (mut identities, mut interfaces, mut addresses) =
             (HashSet::new(), HashSet::new(), HashSet::new());
@@ -479,11 +772,34 @@ pub(super) async fn serve(
     let owned_cancel = cancel.child_token();
     let _guard = owned_cancel.clone().drop_guard();
     let (sender, mut incoming) = mpsc::channel::<Incoming>(64);
-    let protocol = ip::serve(
+    let admitter = match &config.token_admission {
+        Some(admission) => Some(Arc::new(TokenAdmitter::new(
+            admission.clone(),
+            endpoint.id(),
+        )?)),
+        None => None,
+    };
+    let admit = admitter.clone().map(|admitter| -> ip::Admit {
+        Arc::new(move |request: ip::AdmissionRequest| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let grant = admitter.admit(
+                request.peer,
+                &request.network,
+                &request.session_id,
+                request.proxy_authorization(),
+                now,
+            );
+            Box::pin(async move { grant }) as ip::AdmissionFuture
+        })
+    });
+    let protocol = ip::serve_with_admission(
         endpoint,
         config.protocol_grants()?,
         sender,
         owned_cancel.clone(),
+        admit,
     );
     tokio::pin!(protocol);
     let peer_router = Arc::new(PeerRouter::new(&config));
@@ -500,10 +816,11 @@ pub(super) async fn serve(
             }
             next = incoming.recv() => {
                 let Some(request) = next else { break Err(io::Error::other("CONNECT-IP receiver stopped")); };
-                let grant = config.grants.iter().find(|grant| grant.peer == request.peer && grant.network == request.network);
+                let grant = config.grants.iter().find(|grant| grant.peer == request.peer && grant.network == request.network).cloned()
+                    .or_else(|| admitter.as_ref().and_then(|admitter| admitter.claim(request.peer, &request.network, &request.session_id)));
                 let Some(grant) = grant else { request.session.cancel(); let _ = request.ready.send(false); continue; };
                 if !active.insert(grant.interface_name.clone()) { request.session.cancel(); let _ = request.ready.send(false); metrics.errors.fetch_add(1, Ordering::Relaxed); continue; }
-                sessions.spawn(session(request, grant.clone(), metrics.clone(), peer_router.clone(), owned_cancel.child_token()));
+                sessions.spawn(session(request, grant, metrics.clone(), peer_router.clone(), owned_cancel.child_token()));
             }
         }
     };
@@ -968,6 +1285,7 @@ mod tests {
                 interface_name: "dtun0".into(),
                 mtu: 1280,
             }],
+            token_admission: None,
         }
     }
 
@@ -1197,7 +1515,12 @@ mod tests {
     }
     #[test]
     fn rejects_overlapping_or_unsafe_grants() {
-        IpConfig { grants: Vec::new() }.validate().unwrap();
+        IpConfig {
+            grants: Vec::new(),
+            token_admission: None,
+        }
+        .validate()
+        .unwrap();
         let mut cfg = config();
         cfg.validate().unwrap();
         cfg.grants.push(cfg.grants[0].clone());
@@ -1232,9 +1555,12 @@ mod tests {
             cfg.validate_underlay("172.20.0.3".parse().unwrap())
                 .is_err()
         );
-        IpConfig { grants: Vec::new() }
-            .validate_underlay("172.20.0.3".parse().unwrap())
-            .unwrap();
+        IpConfig {
+            grants: Vec::new(),
+            token_admission: None,
+        }
+        .validate_underlay("172.20.0.3".parse().unwrap())
+        .unwrap();
     }
 
     #[test]
@@ -1348,5 +1674,251 @@ mod tests {
             Some("destination_outside_advertised_routes")
         );
         assert!(!packet_allowed(&packet, grant, true));
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn ed25519_signer() -> (ring::signature::Ed25519KeyPair, serde_json::Value) {
+        use base64::Engine;
+        use ring::signature::KeyPair;
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pair.public_key());
+        let jwk = serde_json::json!({"kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": x});
+        (pair, jwk)
+    }
+
+    fn sign(pair: &ring::signature::Ed25519KeyPair, jti: &str) -> String {
+        use base64::Engine;
+        let encode = |value: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        let signed = format!(
+            "{}.{}",
+            encode(serde_json::json!({"alg": "EdDSA", "kid": "k1"})),
+            encode(
+                serde_json::json!({"iss": "https://issuer.example", "aud": "gateway.example",
+                "sub": "workload-a", "iat": NOW - 10, "exp": NOW + 290, "jti": jti})
+            )
+        );
+        let signature = pair.sign(signed.as_bytes());
+        format!(
+            "{signed}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
+
+    fn token_admission(jwk: serde_json::Value) -> TokenAdmission {
+        serde_json::from_value(serde_json::json!({
+            "project": "demo",
+            "network": "local-vpc",
+            "routes": ["2001:db8:10::/64"],
+            "issuers": [{"issuer": "https://issuer.example", "audience": "gateway.example",
+                "keys": {"keys": [jwk]}, "max_lifetime_seconds": 600, "require_jti": true}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn derived_attachment_matches_connect() {
+        // From a Connect lab run: the controller's derivation for project "demo".
+        let client: EndpointId = "5bcef8dd32a40554c2ab9bf59d843532b0d0e370dc58eb9c8b60af9b8ff3c902"
+            .parse()
+            .unwrap();
+        let gateway: EndpointId =
+            "de4d36f2cbc94c9529806df4eb73b103ec4979c4ac7766067d1ddcfcb7c5365e"
+                .parse()
+                .unwrap();
+        let (client_address, gateway_address, interface) =
+            derived_attachment("demo", "local-vpc", &client, &gateway);
+        assert_eq!(
+            client_address,
+            "fd3d:a97:ada2:aed9:65d2:cb73:2359:836f"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+        );
+        assert_eq!(
+            gateway_address,
+            "fd8e:bf0f:30be:e63b:e663:1118:99ce:6d2b"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+        );
+        assert_eq!(interface, "d022e20d002e072");
+    }
+
+    #[test]
+    fn token_admission_admits_once_and_hands_the_grant_to_its_session() {
+        let (pair, jwk) = ed25519_signer();
+        let gateway = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let device = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let admitter = TokenAdmitter::new(token_admission(jwk), gateway).unwrap();
+        let bearer = format!("Bearer {}", sign(&pair, "one"));
+        let basic = bearer.replacen("Bearer", "Basic", 1);
+        assert!(
+            admitter
+                .admit(device, "other-vpc", "s1", Some(&bearer), NOW)
+                .is_none()
+        );
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s1", None, NOW)
+                .is_none()
+        );
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s1", Some(&basic), NOW)
+                .is_none()
+        );
+        let grant = admitter
+            .admit(device, "local-vpc", "s1", Some(&bearer), NOW)
+            .unwrap();
+        let (client, gateway_side, interface) =
+            derived_attachment("demo", "local-vpc", &device, &gateway);
+        assert_eq!(grant.address, IpAddr::V6(client));
+        assert_eq!(grant.mtu, 1280);
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s2", Some(&bearer), NOW)
+                .is_none(),
+            "a token is accepted once"
+        );
+        assert!(admitter.claim(device, "local-vpc", "s2").is_none());
+        let claimed = admitter.claim(device, "local-vpc", "s1").unwrap();
+        assert_eq!(claimed.client_address.addr(), IpAddr::V6(client));
+        assert_eq!(claimed.gateway_address.addr(), IpAddr::V6(gateway_side));
+        assert_eq!(claimed.interface_name, interface);
+        assert_eq!(
+            claimed.routes,
+            vec!["2001:db8:10::/64".parse::<IpNet>().unwrap()]
+        );
+        assert!(claimed.peer_routes.is_empty());
+        assert!(admitter.claim(device, "local-vpc", "s1").is_none());
+    }
+
+    #[test]
+    fn token_admission_refuses_a_derived_address_inside_a_route() {
+        let (pair, jwk) = ed25519_signer();
+        let gateway = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let device = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let (client, _, _) = derived_attachment("demo", "local-vpc", &device, &gateway);
+        let mut admission = token_admission(jwk);
+        admission.routes = vec![IpNet::new(IpAddr::V6(client), 64).unwrap().trunc()];
+        let admitter = TokenAdmitter::new(admission, gateway).unwrap();
+        let token = sign(&pair, "one");
+        let bearer = format!("Bearer {token}");
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s1", Some(&bearer), NOW)
+                .is_none()
+        );
+        assert!(
+            admitter.verifier.verify(&token, NOW).is_ok(),
+            "a request refused after verification does not spend the token"
+        );
+    }
+
+    #[test]
+    fn token_admission_with_no_issuers_refuses_every_token() {
+        let (pair, jwk) = ed25519_signer();
+        let gateway = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let device = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut empty = token_admission(jwk);
+        empty.issuers.clear();
+        let admitter = TokenAdmitter::new(empty, gateway).unwrap();
+        let bearer = format!("Bearer {}", sign(&pair, "one"));
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s1", Some(&bearer), NOW)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn token_admission_spends_a_token_only_when_its_session_claims_the_grant() {
+        let (pair, jwk) = ed25519_signer();
+        let gateway = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let device = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let admitter = TokenAdmitter::new(token_admission(jwk), gateway).unwrap();
+        let bearer = format!("Bearer {}", sign(&pair, "one"));
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s1", Some(&bearer), NOW)
+                .is_some()
+        );
+        admitter.expire_pending(Instant::now() + PENDING_GRANT_TTL);
+        assert!(admitter.claim(device, "local-vpc", "s1").is_none());
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s2", Some(&bearer), NOW)
+                .is_some(),
+            "a grant that no session claimed does not spend the token"
+        );
+
+        let fresh = format!("Bearer {}", sign(&pair, "two"));
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s3", Some(&fresh), NOW)
+                .is_some()
+        );
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s4", Some(&bearer), NOW)
+                .is_some(),
+            "a replaced grant does not spend the token"
+        );
+        assert!(admitter.claim(device, "local-vpc", "s4").is_some());
+        assert!(
+            admitter
+                .admit(device, "local-vpc", "s5", Some(&bearer), NOW)
+                .is_none(),
+            "a claimed grant spends the token"
+        );
+    }
+
+    #[test]
+    fn token_admission_configuration_is_validated() {
+        let (_, jwk) = ed25519_signer();
+        let mut cfg = config();
+        cfg.token_admission = Some(token_admission(jwk.clone()));
+        cfg.validate().unwrap();
+        assert!(
+            cfg.validate_underlay("2001:db8:10::5".parse().unwrap())
+                .is_err()
+        );
+        for routes in [
+            vec![],
+            vec!["10.0.0.0/8"],
+            vec!["fc00::/7"],
+            vec!["::/0"],
+            vec!["2001:db8::/32", "2001:db8:1::/48"],
+        ] {
+            let mut admission = token_admission(jwk.clone());
+            admission.routes = routes.iter().map(|route| route.parse().unwrap()).collect();
+            cfg.token_admission = Some(admission);
+            assert!(cfg.validate().is_err(), "{routes:?}");
+        }
+        let mut admission = token_admission(jwk.clone());
+        admission.issuers.clear();
+        cfg.token_admission = Some(admission);
+        cfg.validate()
+            .expect("no issuers is valid beside a static grant");
+        let mut admission = token_admission(jwk.clone());
+        admission.network = "not a network".into();
+        cfg.token_admission = Some(admission);
+        assert!(cfg.validate().is_err());
+        let mut admission = token_admission(jwk);
+        admission.mtu = 1200;
+        cfg.token_admission = Some(admission);
+        assert!(cfg.validate().is_err());
+        assert!(
+            serde_json::from_value::<IpConfig>(serde_json::json!({
+                "grants": [],
+                "token_admission": {"project": "demo", "network": "local-vpc",
+                    "routes": ["2001:db8:10::/64"], "issuers": [], "unknown": true}
+            }))
+            .is_err()
+        );
     }
 }
