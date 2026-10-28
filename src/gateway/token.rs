@@ -16,9 +16,6 @@
 //!
 //! Rejections carry fixed reasons only: nothing from the token is ever placed in an error or log.
 
-// Nothing calls the verifier until token admission is added; that change removes this.
-#![allow(dead_code)]
-
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, errors::ErrorKind};
 use serde::Deserialize;
