@@ -1,0 +1,18 @@
+[package]
+name = "iroh-packet"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Incoming iroh packet sessions that carry IPv6 packets into one tenant VPC"
+
+[dependencies]
+bytes = "1"
+iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
+thiserror = "2"
+tokio = { version = "1.34.0", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+iroh-relay = { version = "1.0", features = ["server", "test-utils"] }
+tokio = { version = "1.34.0", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
